@@ -5,10 +5,34 @@ library(httr)                 # http calls
 library(jsonlite)             # use of JSON functionality
 
 # Data Import and Cleaning
-final_tbl <- read_csv("../data/glassdoor_reviews.csv") # import dataset
+glassdoor_tbl <- read_csv("../data/glassdoor_reviews.csv") %>%  # import dataset for tidyverse, small enough to import relatively quickly
+  mutate(date_review = ymd(date_review), # convert to POSIX.ct
+         recommend = case_when(
+           recommend == "v" ~ "Positive",
+           recommend == "o" ~ "Neutral",
+           recommend == "x" ~ "Negative",
+           TRUE ~ NA_character_
+         ),
+         ceo_approv = case_when(
+           ceo_approv == "v" ~ "Positive",
+           ceo_approv == "o" ~ "Neutral",
+           ceo_approv == "x" ~ "Negative",
+           TRUE ~ NA_character_
+         ),
+         outlook = case_when(
+           outlook == "v" ~ "Positive",
+           outlook == "o" ~ "Neutral",
+           outlook == "x" ~ "Negative",
+           TRUE ~ NA_character_
+         ),
+         recommend = factor(recommend, levels = c("Negative", "Neutral", "Positive"), ordered = TRUE),
+         ceo_approv = factor(ceo_approv, levels = c("Negative", "Neutral", "Positive"), ordered = TRUE),
+         outlook = factor(outlook, levels = c("Negative", "Neutral", "Positive"), ordered = TRUE),
+         across(overall_rating:senior_mgmt, as.integer) # make Likert-style integers
+  )
 
 # save dataset
-write_rds(final_tbl, "../out/data.RDS") # saves final dataset as per line 3.3
+glassdoor_rds(final_tbl, "../out/data.RDS") # saves final dataset as per line 3.3
 
 get_embedding <- function(text_strings) { #returns embedding vector for any string
   response <- POST(
@@ -24,8 +48,8 @@ get_embedding <- function(text_strings) { #returns embedding vector for any stri
 }
 
 
-# vec <- get_embedding("test")
-# length(vec)
+# vec <- get_embedding("test") # test my embedding function
+# length(vec) # length is 768 from Ollama 
 
 # Visualization
 
