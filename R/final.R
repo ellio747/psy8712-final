@@ -22,3 +22,9 @@ get_embedding <- function(text_strings) { #returns embedding vector for any stri
 
 # vec <- get_embedding("test")
 # length(vec)
+
+# Visualization
+
+# Analysis
+
+# Publication
