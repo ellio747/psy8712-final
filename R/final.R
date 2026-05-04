@@ -12,6 +12,7 @@ library(RWeka)                # n-gram DTM # OpenJDK is an open-source solution 
 library(parallel)             # parallelization
 library(doParallel)           # parallelization
 library(caret)                # machine learning
+library(stm)                  # structural topic modeling
 
 # Parallelizations
 n_cores <- max(1L, detectCores(logical = FALSE) - 1L)  # leave 1 core free
@@ -64,60 +65,86 @@ model_training <- model_tbl[-holdout_indices,] # training data
  
 
 # Begin Parallelization
-local_cluster <- makeCluster(7) # using `detectCores()` I identified 8 cores, subtracting 1, I began the local cluster for parallelization 
-registerDoParallel(local_cluster) # activate cluster
-
-# Step 1: Data Wrangling & Pre-Processing
-tidy_corpus <- model_tbl %>% # Prep-processing using tidytext approach to speed
-  select(doc_id, text = full_review) %>%
-  mutate(
-    text = str_remove_all(text, "(?<=\\b[A-Z])\\.(?=[A-Z]\\b)"), # removes periods inside of abbreviations
-    text = replace_contraction(text), # extends contractions
-    text = str_to_lower(text), # converts all to lowercase
-    text = str_remove_all(text, "[0-9]+"), # removes numbers
-    text = str_remove_all(text, "[[:punct:]]") # removes punctuation
-  ) %>%
-  unnest_tokens(word, text) %>% # splits into one word per row
-  mutate(word = lemmatize_words(word)) %>% # lemmatize words using textstem
-  anti_join(stop_words, by = "word") %>% # removes stopwords with an anti-join
-  relocate(word)
-
-## Conversion into a DTM
-DTM <- DocumentTermMatrix(tidy_corpus) 
-DTM %>% as.matrix %>% as_tibble %>% View
-
-# Step 2: Create a Dataset with NGram tokenization
-small_corpus <- corpus_prep[1:1000,]
-myTokenizer <- function(x) { NGramTokenizer(x, Weka_control(min=1, max=2)) }
-DTM <- DocumentTermMatrix(
-  small_corpus, 
-  control = list(tokenize = myTokenizer))
-slimmed_dtm <- removeSparseTerms(DTM, .97)
-DTM_tbl <- slimmed_dtm %>% as.matrix %>% as_tibble
+# local_cluster <- makeCluster(7) # using `detectCores()` I identified 8 cores, subtracting 1, I began the local cluster for parallelization 
+# registerDoParallel(local_cluster) # activate cluster
 
 # End Parallelization
-stopCluster(local_cluster)
-registerDoSEQ()
+# stopCluster(local_cluster)
+# registerDoSEQ()
 
-# Visualization
+# Step 1: Data Wrangling & Pre-Processing
+unigrams <- model_tbl %>%
+  select(doc_id, text = full_review) %>%
+  mutate(text = str_to_lower(text)) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  mutate(word = lemmatize_words(word))
 
-# Step #3 Analysis
+
+# bigrams <- model_tbl %>%
+#   select(doc_id, text = full_review) %>%
+#   mutate(text = str_to_lower(text)) %>%
+#   unnest_tokens(word, text, token = "ngrams", n = 2)
+
+# Step 2: Create a Dataset with NGram tokenization
+top_words <- unigrams %>% 
+  count(word, sort = TRUE) %>% 
+  filter(n >= 40) %>% 
+  slice_head(n = 3000)
+
+tidy_tokens <- unigrams %>% 
+  semi_join(top_words, by = "word")
+
+doc_sizes <- tidy_tokens %>%
+  count(doc_id)
+
+large_docs <- doc_sizes %>%
+  filter(n > quantile(n, 0.90)) %>%
+  pull(doc_id)
+
+tidy_tokens <- tidy_tokens %>%
+  filter(!doc_id %in% large_docs)
+
+tidy_tokens <- tidy_tokens %>%
+  anti_join(
+    tidy_tokens %>%
+      count(word) %>%
+      filter(n > quantile(n, 0.99)),
+    by = "word"
+  )
+
+# Step #3: Analysis
+
+dfm <- tidy_tokens %>%
+  count(doc_id, word) %>%
+  cast_dfm(doc_id, word, n)
+
+dfm <- quanteda::dfm_trim(
+  dfm,
+  min_termfreq = 50,   
+  min_docfreq = 10
+)
+
 
 ## Topic analysis 
-dfm2stm <- readCorpus(slimmed_dtm, type="slam")
+stm_input <- quanteda::convert(dfm, to = "stm")
 kresult <- searchK(
-  dfm2stm$documents,
-  dfm2stm$vocab,
-  K = seq(2, 20, by = 2)
+  stm_input$documents,
+  stm_input$vocab,
+  K = c(5, 10, 15),
+  heldout = F,
+  cores = n_cores # conducts core parralelization for optimal performance
 )
 plot(kresult)
-topic_model <- stm(dfm2stm$documents, 
-                   dfm2stm$vocab, 
-                   7)
+topic_model <- stm(documents = stm_input$documents, 
+                   vocab = stm_input$vocab, 
+                   K = 10,
+                   data = stm_input$meta,
+                   init.type = "Spectral")
 
 ## Interpretation of topic analysis
 labelTopics(topic_model, n=10)
-findThoughts(topic_model, texts=blogs$documents, n=3)
+# findThoughts(topic_model, texts=model_tbl$full_review, n=3)
 plot(topic_model, type="summary", n=5)
 topicCorr(topic_model)
 plot(topicCorr(topic_model))
