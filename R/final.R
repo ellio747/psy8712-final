@@ -19,7 +19,7 @@ n_cores <- max(1L, detectCores(logical = FALSE) - 1L)  # leave 1 core free
 cat("Using", n_cores, "cores\n")
 
 # Create Stratified Sample
-sample_n <- 50000
+sample_n <- 50000 # I set this sample at 
 
 # Data Import and Cleaning
 import_tbl <- read_csv("../data/glassdoor_reviews.csv") # imports once; read_csv is slower but fast enough for purposes
@@ -38,8 +38,7 @@ glassdoor_tbl <- import_tbl %>%  # import dataset for tidyverse, small enough to
     full_review = str_squish(full_review),
     doc_id = row_number()
   ) %>% 
-  select(-headline, -pros, -cons) %>% 
-  write_rds("../out/data.RDS") # saves final dataset as per line 3.3
+  select(-headline, -pros, -cons) 
 
 model_tbl <- glassdoor_tbl
 
@@ -50,7 +49,8 @@ if (nrow(model_tbl) > sample_n) {
     slice_sample(prop = sample_n / nrow(glassdoor_tbl)) %>%
     ungroup()
   cat("Sampled down to", nrow(model_tbl), "rows\n")
-}
+}%>% 
+  write_rds("../out/data.RDS") # saves final dataset as per line 3.3
 
 cat("Rating distribution:\n")
 print(table(model_tbl$overall_rating))
