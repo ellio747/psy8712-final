@@ -49,8 +49,8 @@ if (nrow(model_tbl) > sample_n) {
     slice_sample(prop = sample_n / nrow(glassdoor_tbl)) %>%
     ungroup()
   cat("Sampled down to", nrow(model_tbl), "rows\n")
-}%>% 
-  write_rds("../out/data.RDS") # saves final dataset as per line 3.3
+} #%>% 
+#   write_rds("../out/data.RDS") # saves final dataset as per line 3.3
 
 cat("Rating distribution:\n")
 print(table(model_tbl$overall_rating))
