@@ -11,6 +11,7 @@ library(textstem)             # tool for lemmatization
 library(RWeka)                # n-gram DTM # OpenJDK is an open-source solution for these java invoking libraries via University software support
 library(parallel)             # parallelization
 library(doParallel)           # parallelization
+library(caret)                # machine learning
 
 # Parallelizations
 n_cores <- max(1L, detectCores(logical = FALSE) - 1L)  # leave 1 core free
@@ -39,11 +40,13 @@ glassdoor_tbl <- import_tbl %>%  # import dataset for tidyverse, small enough to
   select(-headline, -pros, -cons) %>% 
   write_rds("../out/data.RDS") # saves final dataset as per line 3.3
 
+model_tbl <- glassdoor_tbl
+
 # Stratified sample (preserves rating distribution)
-if (nrow(model_tbl) > SAMPLE_N) {
+if (nrow(model_tbl) > sample_n) {
   model_tbl <- model_tbl %>%
     group_by(overall_rating) %>%
-    slice_sample(prop = SAMPLE_N / nrow(model_tbl)) %>%
+    slice_sample(prop = sample_n / nrow(glassdoor_tbl)) %>%
     ungroup()
   cat("Sampled down to", nrow(model_tbl), "rows\n")
 }
@@ -51,34 +54,37 @@ if (nrow(model_tbl) > SAMPLE_N) {
 cat("Rating distribution:\n")
 print(table(model_tbl$overall_rating))
 
-split     <- initial_split(model_tbl, prop = 0.80, strata = overall_rating)
-train_tbl <- training(split)
-test_tbl  <- testing(split)
 
+# Create Holdout and Training Datasets
+holdout_indices <- createDataPartition(model_tbl$doc_id, 
+                                       p = .25, 
+                                       list=F) # This line creates a 25/75 split of holdout:training data
+model_holdout <- model_tbl[holdout_indices,] # holdout data
+model_training <- model_tbl[-holdout_indices,] # training data
  
 
 # Begin Parallelization
 local_cluster <- makeCluster(7) # using `detectCores()` I identified 8 cores, subtracting 1, I began the local cluster for parallelization 
 registerDoParallel(local_cluster) # activate cluster
 
-# Step 1: Data Wrangling 
-corpus <- VCorpus(VectorSource(glassdoor_tbl$full_review))
-
-# Step 2: Pre-Processing
-corpus_prep <- corpus %>%
-  tm_map(content_transformer(function(x)
-    str_remove_all(x, "(?<=\\b[A-Z])\\.(?=[A-Z]\\b)"))) %>%
-  tm_map(content_transformer(replace_contraction)) %>%
-  tm_map(content_transformer(str_to_lower)) %>%
-  tm_map(removeNumbers) %>%
-  tm_map(removePunctuation) %>%
-  tm_map(content_transformer(lemmatize_words)) %>%
-  tm_map(removeWords, stopwords("en")) %>%
-  tm_map(stripWhitespace)
+# Step 1: Data Wrangling & Pre-Processing
+tidy_corpus <- model_tbl %>% # Prep-processing using tidytext approach to speed
+  select(doc_id, text = full_review) %>%
+  mutate(
+    text = str_remove_all(text, "(?<=\\b[A-Z])\\.(?=[A-Z]\\b)"), # removes periods inside of abbreviations
+    text = replace_contraction(text), # extends contractions
+    text = str_to_lower(text), # converts all to lowercase
+    text = str_remove_all(text, "[0-9]+"), # removes numbers
+    text = str_remove_all(text, "[[:punct:]]") # removes punctuation
+  ) %>%
+  unnest_tokens(word, text) %>% # splits into one word per row
+  mutate(word = lemmatize_words(word)) %>% # lemmatize words using textstem
+  anti_join(stop_words, by = "word") %>% # removes stopwords with an anti-join
+  relocate(word)
 
 ## Conversion into a DTM
-# DTM <- DocumentTermMatrix(corpus_prep) 
-# DTM %>% as.matrix %>% as_tibble %>% View
+DTM <- DocumentTermMatrix(tidy_corpus) 
+DTM %>% as.matrix %>% as_tibble %>% View
 
 # Step 2: Create a Dataset with NGram tokenization
 small_corpus <- corpus_prep[1:1000,]
