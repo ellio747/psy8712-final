@@ -13,12 +13,14 @@ library(parallel)             # parallelization
 library(doParallel)           # parallelization
 library(caret)                # machine learning
 library(stm)                  # structural topic modeling
+library(tictoc)               # timing for expanding
+# remotes::install_version("xgboost", version = "1.6.0.1", repos = "https://cran.r-project.org") 
 
 # Parallelization Attributes
 n_cores <- max(1L, detectCores(logical = FALSE) - 1L)  # leave 1 core free
 
 # Create Stratified Sample
-sample_n <- 50000 # I set this sample at 50K to minimize the processing requirements on an 8 core unit and obtain robust results
+sample_n <- 1000 # I set this sample at 50K to minimize the processing requirements on an 8 core unit and obtain robust results
 # note the file is in my gitignore due to its presence behind the kaggle user/password infrastructure
 # also because it is a very large file
 
@@ -51,8 +53,7 @@ if (nrow(model_tbl) > sample_n) { #examines if the number of rows in the tibble 
     group_by(overall_rating) %>% #groups by overall_ratings to obtain a distribution of the baseline overall_ratings
     slice_sample(prop = sample_n / nrow(glassdoor_tbl)) %>% # slice sample takes a representative amount from the distribution at random
     ungroup() # ungroups by overall_rating and places them back in the tibble
-} #%>% 
-#   write_rds("../out/data.RDS") # saves final dataset as per line 3.3
+}
 
 # Create Holdout and Training Datasets
 holdout_indices <- createDataPartition(model_tbl$overall_rating,
@@ -125,8 +126,8 @@ kresult <- searchK(
   stm_input$documents,
   stm_input$vocab,
   K = c(5, 10, 15),
-  heldout = F,
-  cores = n_cores # conducts core parralelization for optimal performance
+  heldout = F#,
+  #cores = 2 # conducts core parralelization for optimal performance
 )
 plot(kresult)
 topic_model <- stm(documents = stm_input$documents, 
@@ -185,8 +186,8 @@ topics_tbl <- tibble(
 #   return(result$embeddings)
 # }
 
-n_cores <- 2
-cl <- makeCluster(n_cores)
+n_cores_2 <- 2
+cl <- makeCluster(n_cores_2)
 registerDoParallel(cl)
 
 get_embedding <- function(text_strings) {
@@ -250,7 +251,12 @@ embed_matrix <- do.call(rbind, embeddings_list)
 colnames(embed_matrix) <- paste0("e_", seq_len(ncol(embed_matrix)))
 embed_tbl <- as_tibble(embed_matrix) %>%
   mutate(doc_id = temp_test$doc_id, .before = 1)
+
+embed_tbl_clean <- embed_tbl %>%
+  mutate(across(e_1:e_768, as.numeric))
+
 stopCluster(cl)
+
 
 dtm_tbl <- tidy_tokens %>%
   count(doc_id, word) %>%
@@ -262,13 +268,27 @@ theta_tbl <- as_tibble(topic_model$theta) %>%
   rename_with(~ paste0("t_", .x)) %>%
   mutate(doc_id = kept_indices, .before = 1)
 
-base_tbl <- model_tbl %>% select(doc_id, overall_rating)
+base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>% 
+  left_join(
+    dtm_tbl, by = "doc_id"
+  ) %>% 
+  left_join(
+    embed_tbl_clean, by = "doc_id"
+  ) %>% 
+  left_join(
+    theta_tbl, by = "doc_id"
+  )  %>% 
+write_rds("../out/data.RDS") # saves final dataset as per line 3.3
+
+model_tbl <- readRDS("out/data.RDS")
+
+base_tbl <- model_tbl %>% select(doc_id, overall_rating)  
 
 feat_A <- base_tbl %>% left_join(dtm_tbl,   by = "doc_id") %>% na.omit()
-feat_B <- base_tbl %>% left_join(embed_tbl, by = "doc_id") %>% na.omit()
+feat_B <- base_tbl %>% left_join(embed_tbl_clean, by = "doc_id") %>% na.omit()
 feat_C <- base_tbl %>% left_join(theta_tbl, by = "doc_id") %>% na.omit()
 feat_D <- base_tbl %>%
-  left_join(embed_tbl, by = "doc_id") %>%
+  left_join(embed_tbl_clean, by = "doc_id") %>%
   left_join(theta_tbl, by = "doc_id") %>%
   na.omit()
 
@@ -305,18 +325,115 @@ modelA2 <- train(overall_rating ~ .,
                  preProcess = c("medianImpute","center","scale","nzv"), 
                  trControl = cv_control)
 
-modelA3 <- train(overall_rating ~ ., 
-                 splits_A$train, 
-                 method = "xgbTree",  
+# modelA3 <- train(overall_rating ~ ., 
+#                  splits_A$train, 
+#                  method = "xgbTree",  
+#                  na.action = na.pass, 
+#                  preProcess = c("medianImpute","center","scale","nzv"), 
+#                  trControl = cv_control)
+
+modelB1 <- train(overall_rating ~ .,
+                 splits_B$train, 
+                 method = "glmnet",  
                  na.action = na.pass, 
                  preProcess = c("medianImpute","center","scale","nzv"), 
                  trControl = cv_control)
+
+
+modelB2 <- train(overall_rating ~ ., 
+                 splits_B$train, 
+                 method = "ranger",  
+                 na.action = na.pass, 
+                 preProcess = c("medianImpute","center","scale","nzv"), 
+                 trControl = cv_control)
+
+# modelB3 <- train(overall_rating ~ ., 
+#                  splits_B$train, 
+#                  method = "xgbTree",  
+#                  na.action = na.pass, 
+#                  preProcess = c("medianImpute","center","scale","nzv"), 
+#                  trControl = cv_control)
+
+modelC1 <- train(overall_rating ~ .,
+                 splits_C$train, 
+                 method = "glmnet",  
+                 na.action = na.pass, 
+                 preProcess = c("medianImpute","center","scale","nzv"), 
+                 trControl = cv_control)
+
+
+modelC2 <- train(overall_rating ~ ., 
+                 splits_C$train, 
+                 method = "ranger",  
+                 na.action = na.pass, 
+                 preProcess = c("medianImpute","center","scale","nzv"), 
+                 trControl = cv_control)
+
+# modelC3 <- train(overall_rating ~ ., 
+#                  splits_C$train, 
+#                  method = "xgbTree",  
+#                  na.action = na.pass, 
+#                  preProcess = c("medianImpute","center","scale","nzv"), 
+#                  trControl = cv_control)
+
+modelD1 <- train(overall_rating ~ .,
+                 splits_D$train, 
+                 method = "glmnet",  
+                 na.action = na.pass, 
+                 preProcess = c("medianImpute","center","scale","nzv"), 
+                 trControl = cv_control)
+
+
+modelD2 <- train(overall_rating ~ ., 
+                 splits_D$train, 
+                 method = "ranger",  
+                 na.action = na.pass, 
+                 preProcess = c("medianImpute","center","scale","nzv"), 
+                 trControl = cv_control)
+
+# modelD3 <- train(overall_rating ~ ., 
+#                  splits_D$train, 
+#                  method = "xgbTree",  
+#                  na.action = na.pass, 
+#                  preProcess = c("medianImpute","center","scale","nzv"), 
+#                  trControl = cv_control)
 
 
 # End Parallelization
 stopCluster(local_cluster)
 registerDoSEQ()
 
+ho_rsq <- function(model, splits) {
+  cor(predict(model, splits$holdout, na.action = na.pass),
+      splits$holdout$overall_rating)^2
+}
+
+results_tbl <- tibble(
+  algo        = c("glmnet","ranger",#"xgbTree",
+                  "glmnet","ranger",#"xgbTree",
+                  "glmnet","ranger",#"xgbTree",
+                  "glmnet","ranger"#,"xgbTree"
+                  ),
+  # feature_set = c(rep("Tokenization",2), rep("Embeddings"2),
+  #                 rep("Topics",2),       rep("Emb+Topics",2)),
+  cv_rsq      = c(
+    max(modelA1$results$Rsquared, na.rm=T), max(modelA2$results$Rsquared, na.rm=T),
+    #max(modelA3$results$Rsquared, na.rm=T), 
+    max(modelB1$results$Rsquared, na.rm=T), max(modelB2$results$Rsquared, na.rm=T), 
+    #max(modelB3$results$Rsquared, na.rm=T),
+    max(modelC1$results$Rsquared, na.rm=T), max(modelC2$results$Rsquared, na.rm=T),
+    #max(modelC3$results$Rsquared, na.rm=T), 
+    max(modelD1$results$Rsquared, na.rm=T), max(modelD2$results$Rsquared, na.rm=T)#, 
+    #max(modelD3$results$Rsquared, na.rm=T)
+  ),
+  ho_rsq      = c(
+    ho_rsq(modelA1, splits_A), ho_rsq(modelA2, splits_A), #ho_rsq(modelA3, splits_A),
+    ho_rsq(modelB1, splits_B), ho_rsq(modelB2, splits_B), #ho_rsq(modelB3, splits_B),
+    ho_rsq(modelC1, splits_C), ho_rsq(modelC2, splits_C), #ho_rsq(modelC3, splits_C),
+    ho_rsq(modelD1, splits_D), ho_rsq(modelD2, splits_D)#, #ho_rsq(modelD3, splits_D)
+  )
+) %>%
+  mutate(across(c(cv_rsq, ho_rsq), ~ str_remove(round(.x, 2), "^0")))
 
 # Publication
 # RQ1. Does the use of embeddings (using the nomic-embed-text LLM embeddings model) improve prediction of satisfaction beyond a rigorous tokenization strategy?
@@ -324,6 +441,30 @@ registerDoSEQ()
 # RQ3. Does the use of embeddings plus topics improve prediction of satisfaction beyond either alone?
 # RQ4. What is the best prediction of overall job satisfaction achievable using text reviews as source data?
 
+
+## Temp Working Section
+sample_idx <- sample(nrow(splits_A$train), 500)
+small_sample <- splits_A$train[sample_idx, ]
+
+# Step 1: Force numeric
+small_sample[] <- lapply(small_sample, as.numeric)
+
+# Step 2: Remove all-NA or all-zero columns
+keep_cols <- colSums(!is.na(small_sample)) > 0 & colSums(small_sample != 0, na.rm = TRUE) > 0
+small_sample_clean <- small_sample[, keep_cols]
+
+# Step 3: Verify
+dim(small_sample_clean)
+sum(is.na(small_sample_clean))
+table(small_sample_clean$overall_rating)
+
+# Step 4: Train
+tic()
+test_model <- train(overall_rating ~ .,
+                    small_sample_clean,
+                    method = "xgbTree",
+                    trControl = trainControl(method = "cv", number = 3, allowParallel = FALSE))
+(toc)
 
 
 
