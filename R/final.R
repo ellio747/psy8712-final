@@ -5,16 +5,18 @@ library(tm)                   # text mining
 library(tidyverse)            # data science tools
 library(httr)                 # http calls
 library(jsonlite)             # use of JSON functionality
-library(textclean)            # pre-processing
 library(tidytext)             # unigram tokenization pre-processing
 library(textstem)             # tool for lemmatization
 library(RWeka)                # n-gram DTM # OpenJDK is an open-source solution for these java invoking libraries via University software support
 library(parallel)             # parallelization
 library(doParallel)           # parallelization
 library(caret)                # machine learning
+library(glmnet)
+library(ranger)
+# remotes::install_version("xgboost", version = "1.7.8.1", repos = "https://cran.r-project.org") 
+library(xgboost)
 library(stm)                  # structural topic modeling
-library(tictoc)               # timing for expanding
-# remotes::install_version("xgboost", version = "1.6.0.1", repos = "https://cran.r-project.org") 
+
 
 # Parallelization Attributes
 n_cores <- max(1L, detectCores(logical = FALSE) - 1L)  # leave 1 core free
@@ -116,7 +118,7 @@ plot(kresult) # these plots show a consistent elbow-type solution at 5 topics
 topic_model <- stm(
   documents = dfm2stm$documents,
   vocab = dfm2stm$vocab,
-  K = 4, # 4 topics from the results of the kresult plot
+  K = 5, # 5 topics from the results of the kresult plot
   init.type = "LDA" # selected a Latent Dirichlet Allocation as in class
 )
 
@@ -134,11 +136,12 @@ dropped_indices <- setdiff(all_indices, kept_indices)
 
 # Assigns topic labels as user input to the kresult obtained topics, place in tibble for easy access
 topic_labels <- tibble(
-  topic       = 1:4,
+  topic       = 1:5,
   topic_label = c("Company Culture",
-                  "Compensation and Benefits Issues",
                   "Work-life Balance",
-                  "Career Development Issues")
+                  "Compensation and Benefits Issues",
+                  "Career Development Issues",
+                  "Team Level Management")
 )
 
 # This tibble coding provides for the topics and all the retained tokens
@@ -154,6 +157,7 @@ n_cores_2 <- 2
 cl <- makeCluster(n_cores_2)
 registerDoParallel(cl)
 
+# NOTE: ensure ollama serve is running in a Terminal window in order to execute the dependencies of the embedding model
 get_embedding <- function(text_strings) { #returns embedding vector for any string
   response <- httr::POST(
     url = "http://localhost:11434/api/embed", # post to local Ollama server
@@ -231,7 +235,7 @@ base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>%
   )
 
 write_rds(base_tbl_save, "../out/data.RDS") # saves final dataset as per line 3.3
-
+# base_tbl <- readRDS("../out/data.RDS")
 
 base_tbl <- model_tbl %>% select(doc_id, overall_rating)  
 
@@ -285,12 +289,15 @@ modA2_tm <- system.time({
   )
 })
 
-# modelA3 <- train(overall_rating ~ ., 
-#                  splits_A$train, 
-#                  method = "xgbTree",  
-#                  na.action = na.pass, 
-#                  preProcess = c("medianImpute","center","scale","nzv"), 
-#                  trControl = cv_control)
+modA3_tm <- system.time({
+  modelA3 <- train(overall_rating ~ .,
+                   splits_A$train,
+                   method = "xgbTree",
+                   na.action = na.pass,
+                   preProcess = c("medianImpute","center","scale","nzv"),
+                   trControl = cv_control
+  )
+})
 
 modB1_tm <- system.time({
   modelB1 <- train(overall_rating ~ .,
@@ -312,12 +319,15 @@ modB2_tm <- system.time({
   )
 })
 
-# modelB3 <- train(overall_rating ~ ., 
-#                  splits_B$train, 
-#                  method = "xgbTree",  
-#                  na.action = na.pass, 
-#                  preProcess = c("medianImpute","center","scale","nzv"), 
-#                  trControl = cv_control)
+modB3_tm <- system.time({
+  modelB3 <- train(overall_rating ~ .,
+                   splits_B$train,
+                   method = "xgbTree",
+                   na.action = na.pass,
+                   preProcess = c("medianImpute","center","scale","nzv"),
+                   trControl = cv_control
+  )
+})
 
 modC1_tm <- system.time({
   modelC1 <- train(overall_rating ~ .,
@@ -340,12 +350,15 @@ modC2_tm <- system.time({
   )
 })
 
-# modelC3 <- train(overall_rating ~ ., 
-#                  splits_C$train, 
-#                  method = "xgbTree",  
-#                  na.action = na.pass, 
-#                  preProcess = c("medianImpute","center","scale","nzv"), 
-#                  trControl = cv_control)
+modC3_tm <- system.time({
+  modelC3 <- train(overall_rating ~ .,
+                   splits_C$train,
+                   method = "xgbTree",
+                   na.action = na.pass,
+                   preProcess = c("medianImpute","center","scale","nzv"),
+                   trControl = cv_control
+  )
+})
 
 modD1_tm <- system.time({
   modelD1 <- train(overall_rating ~ .,
@@ -368,12 +381,15 @@ modD2_tm <- system.time({
   )
 })
 
-# modelD3 <- train(overall_rating ~ ., 
-#                  splits_D$train, 
-#                  method = "xgbTree",  
-#                  na.action = na.pass, 
-#                  preProcess = c("medianImpute","center","scale","nzv"), 
-#                  trControl = cv_control)
+modD3_tm <- system.time({
+  modelD3 <- train(overall_rating ~ .,
+                   splits_D$train,
+                   method = "xgbTree",
+                   na.action = na.pass,
+                   preProcess = c("medianImpute","center","scale","nzv"),
+                   trControl = cv_control
+  )
+})
 
 
 # End Parallelization
@@ -386,28 +402,24 @@ ho_rsq <- function(model, splits) {
 }
 
 results_tbl <- tibble(
-  algo        = c("glmnet","ranger",#"xgbTree",
-                  "glmnet","ranger",#"xgbTree",
-                  "glmnet","ranger",#"xgbTree",
-                  "glmnet","ranger"#,"xgbTree"
-                  ),
-  # feature_set = c(rep("Tokenization",2), rep("Embeddings"2),
-  #                 rep("Topics",2),       rep("Emb+Topics",2)),
+  algo        = c("glmnet","ranger", "xgbTree",
+                  "glmnet","ranger", "xgbTree",
+                  "glmnet","ranger", "xgbTree",
+                  "glmnet","ranger","xgbTree")
+                  ,
+  feature_set = c(rep("Tokenization", 3), rep("Embeddings", 3),
+                  rep("Topics", 3), rep("Emb+Topics", 3)),
   cv_rsq      = c(
-    max(modelA1$results$Rsquared, na.rm=T), max(modelA2$results$Rsquared, na.rm=T),
-    #max(modelA3$results$Rsquared, na.rm=T), 
-    max(modelB1$results$Rsquared, na.rm=T), max(modelB2$results$Rsquared, na.rm=T), 
-    #max(modelB3$results$Rsquared, na.rm=T),
-    max(modelC1$results$Rsquared, na.rm=T), max(modelC2$results$Rsquared, na.rm=T),
-    #max(modelC3$results$Rsquared, na.rm=T), 
-    max(modelD1$results$Rsquared, na.rm=T), max(modelD2$results$Rsquared, na.rm=T)#, 
-    #max(modelD3$results$Rsquared, na.rm=T)
+    max(modelA1$results$Rsquared, na.rm=T), max(modelA2$results$Rsquared, na.rm=T), max(modelA3$results$Rsquared, na.rm=T), 
+    max(modelB1$results$Rsquared, na.rm=T), max(modelB2$results$Rsquared, na.rm=T), max(modelB3$results$Rsquared, na.rm=T),
+    max(modelC1$results$Rsquared, na.rm=T), max(modelC2$results$Rsquared, na.rm=T), max(modelC3$results$Rsquared, na.rm=T), 
+    max(modelD1$results$Rsquared, na.rm=T), max(modelD2$results$Rsquared, na.rm=T), max(modelD3$results$Rsquared, na.rm=T)
   ),
   ho_rsq      = c(
-    ho_rsq(modelA1, splits_A), ho_rsq(modelA2, splits_A), #ho_rsq(modelA3, splits_A),
-    ho_rsq(modelB1, splits_B), ho_rsq(modelB2, splits_B), #ho_rsq(modelB3, splits_B),
-    ho_rsq(modelC1, splits_C), ho_rsq(modelC2, splits_C), #ho_rsq(modelC3, splits_C),
-    ho_rsq(modelD1, splits_D), ho_rsq(modelD2, splits_D)#, #ho_rsq(modelD3, splits_D)
+    ho_rsq(modelA1, splits_A), ho_rsq(modelA2, splits_A), ho_rsq(modelA3, splits_A),
+    ho_rsq(modelB1, splits_B), ho_rsq(modelB2, splits_B), ho_rsq(modelB3, splits_B),
+    ho_rsq(modelC1, splits_C), ho_rsq(modelC2, splits_C), ho_rsq(modelC3, splits_C),
+    ho_rsq(modelD1, splits_D), ho_rsq(modelD2, splits_D), ho_rsq(modelD3, splits_D)
   )
 ) %>%
   mutate(across(c(cv_rsq, ho_rsq), ~ str_remove(round(.x, 2), "^0")))
@@ -415,6 +427,7 @@ results_tbl <- tibble(
 times_tbl <- tibble( 
   glmnet_time = str_remove(round(c(modA1_tm[[3]],modB1_tm[[3]],modC1_tm[[3]],modD1_tm[[3]]), 2), "^0"),
   ranger_time = str_remove(round(c(modA2_tm[[3]],modB2_tm[[3]],modC2_tm[[3]],modD2_tm[[3]]), 2), "^0"),
+  xgbTree_time = str_remove(round(c(modA3_tm[[3]],modB3_tm[[3]],modC3_tm[[3]],modD3_tm[[3]]), 2), "^0"),
 ) 
 
 # Publication
@@ -422,31 +435,5 @@ times_tbl <- tibble(
 # RQ2. Does the use of topics improve prediction of satisfaction beyond a rigorous tokenization strategy?
 # RQ3. Does the use of embeddings plus topics improve prediction of satisfaction beyond either alone?
 # RQ4. What is the best prediction of overall job satisfaction achievable using text reviews as source data?
-
-
-## Temp Working Section
-sample_idx <- sample(nrow(splits_A$train), 500)
-small_sample <- splits_A$train[sample_idx, ]
-
-# Step 1: Force numeric
-small_sample[] <- lapply(small_sample, as.numeric)
-
-# Step 2: Remove all-NA or all-zero columns
-keep_cols <- colSums(!is.na(small_sample)) > 0 & colSums(small_sample != 0, na.rm = TRUE) > 0
-small_sample_clean <- small_sample[, keep_cols]
-
-# Step 3: Verify
-dim(small_sample_clean)
-sum(is.na(small_sample_clean))
-table(small_sample_clean$overall_rating)
-
-# Step 4: Train
-test_model <- train(overall_rating ~ .,
-                    small_sample_clean,
-                    method = "xgbTree",
-                    trControl = trainControl(method = "cv", number = 3, allowParallel = FALSE))
-
-
-
 
 # save.image(file = "../out/final.RData") #saves an .RData file as per line 3.4
