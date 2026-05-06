@@ -73,93 +73,72 @@ corpus_prep <- model_tbl %>%
   anti_join(stop_words, by = "word") %>%
   mutate(word = lemmatize_words(word))
 
+# Step 2: NGram tokenization
+corpus_source_tbl <- corpus_prep %>%
+  group_by(doc_id) %>%
+  summarise(text = paste(word, collapse = " "))
 
-# bigrams <- model_tbl %>%
-#   select(doc_id, text = full_review) %>%
-#   mutate(text = str_to_lower(text)) %>%
-#   unnest_tokens(word, text, token = "ngrams", n = 2)
+# Keep doc_ids in the same order as the corpus
+corpus_doc_ids <- corpus_source_tbl$doc_id
 
-# Step 2: Create a Dataset with NGram tokenization
-top_words <- corpus_prep %>% 
-  count(word, sort = TRUE) %>% 
-  filter(n >= 40) %>% 
-  slice_head(n = 3000)
+corpus_source <- corpus_source_tbl %>%
+  pull(text) %>%
+  VectorSource() %>%
+  VCorpus()
 
-tidy_tokens <- corpus_prep %>% 
-  semi_join(top_words, by = "word")
+myTokenizer <- function(x) {
+  unlist(lapply(ngrams(words(x), 1:2), paste, collapse = " "))
+}
 
-doc_sizes <- tidy_tokens %>%
-  count(doc_id)
-
-large_docs <- doc_sizes %>%
-  filter(n > quantile(n, 0.90)) %>%
-  pull(doc_id)
-
-tidy_tokens <- tidy_tokens %>%
-  filter(!doc_id %in% large_docs)
-
-tidy_tokens <- tidy_tokens %>%
-  anti_join(
-    tidy_tokens %>%
-      count(word) %>%
-      filter(n > quantile(n, 0.99)),
-    by = "word"
-  )
-
-# Step 3: Analysis of model
-
-#Convert to DTM
-dtm <- tidy_tokens %>%
-  count(doc_id, word) %>%
-  cast_dfm(doc_id, word, n)
-
-dtm <- quanteda::dfm_trim( # trims low represented words
-  dtm,
-  min_termfreq = 50,   
-  min_docfreq = 10
+glassdoor_dtm <- DocumentTermMatrix(
+  corpus_source,
+  control = list(tokenize = myTokenizer)
 )
 
+# This trims sparse terms, setting sparseness to a small term
+glassdoor_slim_dtm <- removeSparseTerms(glassdoor_dtm, .998)
 
-## Topic analysis 
-stm_input <- quanteda::convert(dtm, to = "stm")
+# Ratio of docs (N) to terms (k) = 3.16 N/k ratio
+nrow(model_tbl) / length(glassdoor_slim_dtm$dimnames$Terms)
+
+# Convert DTM to STM format using slam
+dfm2stm <- readCorpus(glassdoor_slim_dtm, type = "slam")
+
+# Obtain optimal k, using searchK for diagnostic model
 kresult <- searchK(
-  stm_input$documents,
-  stm_input$vocab,
-  K = c(5, 10, 15),
-  heldout = F#,
-  #cores = 2 # conducts core parralelization for optimal performance
+  dfm2stm$documents,
+  dfm2stm$vocab,
+  K = seq(3, 10, by = 1)
 )
-plot(kresult)
-topic_model <- stm(documents = stm_input$documents, 
-                   vocab = stm_input$vocab, 
-                   K = 10,
-                   data = stm_input$meta,
-                   init.type = "Spectral")
+plot(kresult) # these plots show a consistent elbow-type solution at 5 topics
 
-## Interpretation of topic analysis
-labelTopics(topic_model, n=10)
-plot(topic_model, type="summary", n=5)
-topicCorr(topic_model)
-plot(topicCorr(topic_model))
+# Fit the Latent Dirichlet Allocation Structural Topic Model (STM)
+topic_model <- stm(
+  documents = dfm2stm$documents,
+  vocab = dfm2stm$vocab,
+  K = 4, # 4 topics from the results of the kresult plot
+  init.type = "LDA" # selected a Latent Dirichlet Allocation as in class
+)
+
+# Interpretation of topic analysis using various analytic results
+labelTopics(topic_model, n=10) # prints 10 words from each topic and examined FREX for labeling
+plot(topic_model, type="summary", n=5) # plots, summarizes the topic models
+topicCorr(topic_model) # provides intercorrelations of topic models, evaluating correlation strength of topics
+plot(topicCorr(topic_model)) # this is an output that shows the graphical relationship between topics
 
 # These three lines designate the document indices that have been retained & dropped
-kept_indices  <- as.integer(names(stm_input$documents))
-all_indices   <- model_tbl$doc_id
+kept_positions  <- as.integer(names(dfm2stm$documents))
+kept_indices    <- corpus_doc_ids[kept_positions]   # map position -> true doc_id
+all_indices     <- model_tbl$doc_id
 dropped_indices <- setdiff(all_indices, kept_indices)
 
-# Assigns topic lables as user input to the kernal obtained topics
+# Assigns topic labels as user input to the kresult obtained topics, place in tibble for easy access
 topic_labels <- tibble(
-  topic       = 1:10,
-  topic_label = c("WFH Policies",
-                  "Employee Perks",
-                  "Consulting and Client Exposure",
+  topic       = 1:4,
+  topic_label = c("Company Culture",
                   "Compensation and Benefits Issues",
-                  "Workplace Stessors",
-                  "Career Growth Issues",
-                  "Bureacratic Gridlock",
-                  "Finance & Banking",
-                  "Leadership and Development",
-                  "Skill Development & Training")
+                  "Work-life Balance",
+                  "Career Development Issues")
 )
 
 # This tibble coding provides for the topics and all the retained tokens
@@ -170,44 +149,27 @@ topics_tbl <- tibble(
 ) %>%
   left_join(topic_labels, by = "topic")
 
-
-
-# Obtain embeddings function
-# get_embedding <- function(text_strings) { #returns embedding vector for any string
-#   response <- POST(
-#     url = "http://localhost:11434/api/embed", # post to local Ollama server
-#     content_type_json(), # alerts the embedding will come from JSON 
-#     body = toJSON(list(
-#       model = "nomic-embed-text", # uses the Ollama model specified in instructions
-#       input = text_strings # input is the text to embed
-#     ), auto_unbox = TRUE) # keeps single values from being wrapped in array
-#   )
-#   result <- content(response, as = "parsed")
-#   return(result$embeddings)
-# }
-
+# Obtain embeddings
 n_cores_2 <- 2
 cl <- makeCluster(n_cores_2)
 registerDoParallel(cl)
 
-get_embedding <- function(text_strings) {
+get_embedding <- function(text_strings) { #returns embedding vector for any string
   response <- httr::POST(
-    url = "http://localhost:11434/api/embed",
-    httr::content_type_json(),
+    url = "http://localhost:11434/api/embed", # post to local Ollama server
+    httr::content_type_json(), # alerts the embedding will come from JSON
     body = jsonlite::toJSON(list(
-      model = "nomic-embed-text",
-      input = as.character(text_strings)
-    ), auto_unbox = TRUE)
+      model = "nomic-embed-text", # uses the Ollama model specified in instructions
+      input = as.character(text_strings) # input is the text to embed
+    ), auto_unbox = TRUE) # keeps single values from being wrapped in array
   )
-  
-  result <- httr::content(response, as = "parsed")
-  
+  result <- content(response, as = "parsed")
   if (!is.null(result$embeddings)) return(result$embeddings)
   if (!is.null(result$embedding)) return(list(result$embedding))
-  
   stop("No embeddings returned")
 }
 
+# Establish a batch process to pull from the ollama server due to size
 batch_size <- 64
 temp_test <- model_tbl %>%
   filter(doc_id %in% kept_indices)
@@ -219,55 +181,44 @@ batch_indices <- split(seq_len(n_docs),
 
 embeddings_list <- foreach(idx = batch_indices,
                            .packages = c("httr", "jsonlite"),
-                           .combine = "c") %dopar% {
-                             
+                           .combine = "c") %do% {  # <-- %do% not %dopar%
                              batch <- texts_all_test[idx]
-                             
-                             # simple retry
                              for (i in 1:3) {
                                res <- try(get_embedding(batch), silent = TRUE)
                                if (!inherits(res, "try-error")) break
                                Sys.sleep(1)
                              }
-                             
-                             if (inherits(res, "try-error")) {
-                               stop("Batch failed after retries")
-                             }
-                             
-                             res  # returns list of vectors
+                             if (inherits(res, "try-error")) stop("Batch failed after retries")
+                             res
                            }
 
+stopCluster(cl)
 
  
-# # Obtain Embedding Matrix
-# embeddings_list <- get_embedding(temp_test$full_review)
-# 
-# embed_matrix <- do.call(rbind, embeddings_list)
-# colnames(embed_matrix) <- paste0("e_", seq_len(ncol(embed_matrix)))
-# embed_tbl <- as_tibble(embed_matrix) %>%
-#   mutate(doc_id = temp_test$doc_id, .before = 1)
-
+# Obtain Embedding Matrix
 embed_matrix <- do.call(rbind, embeddings_list)
 colnames(embed_matrix) <- paste0("e_", seq_len(ncol(embed_matrix)))
 embed_tbl <- as_tibble(embed_matrix) %>%
   mutate(doc_id = temp_test$doc_id, .before = 1)
 
+# Create embeddings tibble
 embed_tbl_clean <- embed_tbl %>%
-  mutate(across(e_1:e_768, as.numeric))
+  mutate(across(e_1:e_768, as.numeric)) # generating numeric embeddings rather than a list
 
-stopCluster(cl)
-
-
-dtm_tbl <- tidy_tokens %>%
+# Create a document term tibble
+dtm_tbl <- corpus_prep %>%
+  filter(doc_id %in% kept_indices) %>% 
   count(doc_id, word) %>%
   pivot_wider(names_from = word, values_from = n,
               values_fill = 0, names_prefix = "w_") %>%
   mutate(doc_id = as.integer(doc_id))
 
+# Create a theta tibble (probabilities)
 theta_tbl <- as_tibble(topic_model$theta) %>%
   rename_with(~ paste0("t_", .x)) %>%
   mutate(doc_id = kept_indices, .before = 1)
 
+# Combine tibbles to serve as final dataset
 base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>% 
   left_join(
     dtm_tbl, by = "doc_id"
@@ -277,10 +228,10 @@ base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>%
   ) %>% 
   left_join(
     theta_tbl, by = "doc_id"
-  )  %>% 
-write_rds("../out/data.RDS") # saves final dataset as per line 3.3
+  )
 
-model_tbl <- readRDS("out/data.RDS")
+write_rds(base_tbl_save, "../out/data.RDS") # saves final dataset as per line 3.3
+
 
 base_tbl <- model_tbl %>% select(doc_id, overall_rating)  
 
@@ -310,20 +261,29 @@ cv_control <- trainControl(method = "cv", number = 10, verboseIter = T)
 local_cluster <- makeCluster(n_cores)
 registerDoParallel(local_cluster) # activate cluster
 
-modelA1 <- train(overall_rating ~ .,
-                 splits_A$train, 
-                 method = "glmnet",  
-                 na.action = na.pass, 
-                 preProcess = c("medianImpute","center","scale","nzv"), 
-                 trControl = cv_control)
+
+modA1_tm <- system.time({
+  modelA1 <- train(
+    overall_rating ~ .,
+    splits_A$train, 
+    method = "glmnet",  
+    na.action = na.pass, 
+    preProcess = c("medianImpute","center","scale","nzv"), 
+    trControl = cv_control
+  )
+})
 
 
-modelA2 <- train(overall_rating ~ ., 
-                 splits_A$train, 
-                 method = "ranger",  
-                 na.action = na.pass, 
-                 preProcess = c("medianImpute","center","scale","nzv"), 
-                 trControl = cv_control)
+modA2_tm <- system.time({
+  modelA2 <- train(
+    overall_rating ~ ., 
+    splits_A$train, 
+    method = "ranger",  
+    na.action = na.pass, 
+    preProcess = c("medianImpute","center","scale","nzv"), 
+    trControl = cv_control
+  )
+})
 
 # modelA3 <- train(overall_rating ~ ., 
 #                  splits_A$train, 
@@ -332,20 +292,25 @@ modelA2 <- train(overall_rating ~ .,
 #                  preProcess = c("medianImpute","center","scale","nzv"), 
 #                  trControl = cv_control)
 
-modelB1 <- train(overall_rating ~ .,
-                 splits_B$train, 
-                 method = "glmnet",  
-                 na.action = na.pass, 
-                 preProcess = c("medianImpute","center","scale","nzv"), 
-                 trControl = cv_control)
+modB1_tm <- system.time({
+  modelB1 <- train(overall_rating ~ .,
+                   splits_B$train, 
+                   method = "glmnet",  
+                   na.action = na.pass, 
+                   preProcess = c("medianImpute","center","scale","nzv"), 
+                   trControl = cv_control
+  )
+})
 
-
-modelB2 <- train(overall_rating ~ ., 
-                 splits_B$train, 
-                 method = "ranger",  
-                 na.action = na.pass, 
-                 preProcess = c("medianImpute","center","scale","nzv"), 
-                 trControl = cv_control)
+modB2_tm <- system.time({
+  modelB2 <- train(overall_rating ~ ., 
+                   splits_B$train, 
+                   method = "ranger",  
+                   na.action = na.pass, 
+                   preProcess = c("medianImpute","center","scale","nzv"), 
+                   trControl = cv_control
+  )
+})
 
 # modelB3 <- train(overall_rating ~ ., 
 #                  splits_B$train, 
@@ -354,20 +319,26 @@ modelB2 <- train(overall_rating ~ .,
 #                  preProcess = c("medianImpute","center","scale","nzv"), 
 #                  trControl = cv_control)
 
-modelC1 <- train(overall_rating ~ .,
-                 splits_C$train, 
-                 method = "glmnet",  
-                 na.action = na.pass, 
-                 preProcess = c("medianImpute","center","scale","nzv"), 
-                 trControl = cv_control)
+modC1_tm <- system.time({
+  modelC1 <- train(overall_rating ~ .,
+                   splits_C$train, 
+                   method = "glmnet",  
+                   na.action = na.pass, 
+                   preProcess = c("medianImpute","center","scale","nzv"), 
+                   trControl = cv_control
+  )
+})
 
 
-modelC2 <- train(overall_rating ~ ., 
-                 splits_C$train, 
-                 method = "ranger",  
-                 na.action = na.pass, 
-                 preProcess = c("medianImpute","center","scale","nzv"), 
-                 trControl = cv_control)
+modC2_tm <- system.time({
+  modelC2 <- train(overall_rating ~ ., 
+                   splits_C$train, 
+                   method = "ranger",  
+                   na.action = na.pass, 
+                   preProcess = c("medianImpute","center","scale","nzv"), 
+                   trControl = cv_control
+  )
+})
 
 # modelC3 <- train(overall_rating ~ ., 
 #                  splits_C$train, 
@@ -376,20 +347,26 @@ modelC2 <- train(overall_rating ~ .,
 #                  preProcess = c("medianImpute","center","scale","nzv"), 
 #                  trControl = cv_control)
 
-modelD1 <- train(overall_rating ~ .,
-                 splits_D$train, 
-                 method = "glmnet",  
-                 na.action = na.pass, 
-                 preProcess = c("medianImpute","center","scale","nzv"), 
-                 trControl = cv_control)
+modD1_tm <- system.time({
+  modelD1 <- train(overall_rating ~ .,
+                   splits_D$train, 
+                   method = "glmnet",  
+                   na.action = na.pass, 
+                   preProcess = c("medianImpute","center","scale","nzv"), 
+                   trControl = cv_control
+  )
+})
 
 
-modelD2 <- train(overall_rating ~ ., 
-                 splits_D$train, 
-                 method = "ranger",  
-                 na.action = na.pass, 
-                 preProcess = c("medianImpute","center","scale","nzv"), 
-                 trControl = cv_control)
+modD2_tm <- system.time({
+  modelD2 <- train(overall_rating ~ ., 
+                   splits_D$train, 
+                   method = "ranger",  
+                   na.action = na.pass, 
+                   preProcess = c("medianImpute","center","scale","nzv"), 
+                   trControl = cv_control
+  )
+})
 
 # modelD3 <- train(overall_rating ~ ., 
 #                  splits_D$train, 
@@ -435,6 +412,11 @@ results_tbl <- tibble(
 ) %>%
   mutate(across(c(cv_rsq, ho_rsq), ~ str_remove(round(.x, 2), "^0")))
 
+times_tbl <- tibble( 
+  glmnet_time = str_remove(round(c(modA1_tm[[3]],modB1_tm[[3]],modC1_tm[[3]],modD1_tm[[3]]), 2), "^0"),
+  ranger_time = str_remove(round(c(modA2_tm[[3]],modB2_tm[[3]],modC2_tm[[3]],modD2_tm[[3]]), 2), "^0"),
+) 
+
 # Publication
 # RQ1. Does the use of embeddings (using the nomic-embed-text LLM embeddings model) improve prediction of satisfaction beyond a rigorous tokenization strategy?
 # RQ2. Does the use of topics improve prediction of satisfaction beyond a rigorous tokenization strategy?
@@ -459,12 +441,10 @@ sum(is.na(small_sample_clean))
 table(small_sample_clean$overall_rating)
 
 # Step 4: Train
-tic()
 test_model <- train(overall_rating ~ .,
                     small_sample_clean,
                     method = "xgbTree",
                     trControl = trainControl(method = "cv", number = 3, allowParallel = FALSE))
-(toc)
 
 
 
