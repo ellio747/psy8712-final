@@ -1,163 +1,144 @@
 # Script settings and resources
-set.seed(123456)              # reproducibility of code
+set.seed(123456)              # reproducibility of code, important for this to go at the very top for entire code pipeline reproducibility
 setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
-library(tm)                   # text mining
 library(tidyverse)            # data science tools
+library(tm)                   # text mining
 library(httr)                 # http calls
 library(jsonlite)             # use of JSON functionality
 library(tidytext)             # unigram tokenization pre-processing
 library(textstem)             # tool for lemmatization
 library(RWeka)                # n-gram DTM # OpenJDK is an open-source solution for these java invoking libraries via University software support
+library(stm)                  # structural topic modeling
 library(parallel)             # parallelization
 library(doParallel)           # parallelization
 library(caret)                # machine learning
-library(glmnet)
-library(ranger)
+library(glmnet)               # machine learning model #1
+library(ranger)               # machine learning model #2
 # remotes::install_version("xgboost", version = "1.7.8.1", repos = "https://cran.r-project.org") 
-library(xgboost)
-library(stm)                  # structural topic modeling
-
-
-# Parallelization Attributes
-n_cores <- max(1L, detectCores(logical = FALSE) - 1L)  # leave 1 core free
-
-# Create Stratified Sample
-sample_n <- 1000 # I set this sample at 50K to minimize the processing requirements on an 8 core unit and obtain robust results
-# note the file is in my gitignore due to its presence behind the kaggle user/password infrastructure
-# also because it is a very large file
+library(xgboost)              # machine learning model #3
 
 # Data Import and Cleaning
 import_tbl <- read_csv("../data/glassdoor_reviews.csv") # imports once; read_csv is slower but fast enough for purposes
+# note the file is in my gitignore due to its presence behind the kaggle user/password infrastructure
 
-# Creation of tibble to hold my glassdoor reviews
+## Creation of tibble to hold my glassdoor reviews
 glassdoor_tbl <- import_tbl %>%  # import dataset for tidyverse, small enough to import relatively quickly
   mutate(overall_rating = as.integer(overall_rating)) %>%  # convert outcome --> `overall_rating` to integer
   select(overall_rating, headline, pros, cons) %>%  # retain outcome and text columns
-  filter(!is.na(overall_rating)) %>%  # drop where the outcome is missing
+  filter(!is.na(overall_rating)) %>%  # drop where the outcome is missing, which is an essential requirement of NLP
   mutate( # this creates a full_review variable combining the pro, con, and headlines into a single string
-    full_review = paste(
-      replace_na(headline, ""),
-      replace_na(pros, ""),
-      replace_na(cons, ""),
-      sep = " "
-    ),
+    full_review = str_c(headline, pros, cons, sep = " ", na.rm = TRUE),
     full_review = str_squish(full_review), # removes whitespace
     doc_id = row_number() # assigns a parent document id
   ) %>% 
-  select(-headline, -pros, -cons) # removes unnecessary columns
+  select(-headline, -pros, -cons) # removes unnecessary sub-text columns
 
-# Renames the glassdoor starting tibble to my model tibble
-model_tbl <- glassdoor_tbl 
 
-# Stratified sample (preserves rating distribution)
-if (nrow(model_tbl) > sample_n) { #examines if the number of rows in the tibble is greater than the sample size set at 50K
-  model_tbl <- model_tbl %>%
-    group_by(overall_rating) %>% #groups by overall_ratings to obtain a distribution of the baseline overall_ratings
-    slice_sample(prop = sample_n / nrow(glassdoor_tbl)) %>% # slice sample takes a representative amount from the distribution at random
-    ungroup() # ungroups by overall_rating and places them back in the tibble
-}
+## Create Stratified Sample
+sample_n <- 5000 # I set this sample at 2K to minimize the processing requirements on an 8 core unit and obtain robust results
+
+# Stratified sample (preserves rating distribution) for model creation
+model_tbl <- glassdoor_tbl %>%
+  group_by(overall_rating) %>% # groups by overall_ratings to obtain a distribution of the baseline overall_ratings
+  slice_sample(prop = sample_n / nrow(glassdoor_tbl)) %>% # slice sample takes a representative amount from the distribution at random
+  ungroup() # ungroups by overall_rating and places them back in the tibble
 
 # Create Holdout and Training Datasets
-holdout_indices <- createDataPartition(model_tbl$overall_rating,
-                                       p = .25,
-                                       list=F) # This line creates a 25/75 split of holdout:training data
-model_holdout <- model_tbl[holdout_indices,] # holdout data
-model_training <- model_tbl[-holdout_indices,] # training data
+holdout_indices <- createDataPartition(model_tbl$overall_rating, p = .25, list=F) # This line creates a 25/75 split of holdout:training data
+model_holdout <- model_tbl[holdout_indices,]    # holdout data
+model_training <- model_tbl[-holdout_indices,]  # training data
 
-# Analysis
+# Analysis (Step 1 - Tokenization of NLP Dataset)
 
-# Creation of the topic model
-# Step 1: Data Wrangling & Pre-Processing
-corpus_prep <- model_tbl %>%
-  select(doc_id, text = full_review) %>%
-  mutate(text = str_to_lower(text)) %>%
-  unnest_tokens(word, text) %>%
-  anti_join(stop_words, by = "word") %>%
-  mutate(word = lemmatize_words(word))
+## Following 4 steps of Natural Language Processing (See 8712 Week 12 Slides for steps)
+## Step 1: Data Wrangling/Munging
+corpus <- VCorpus(VectorSource(model_tbl$full_review)) # creation of volitle corpus; keeps documents in memory rather than on disk
 
-# Step 2: NGram tokenization
-corpus_source_tbl <- corpus_prep %>%
-  group_by(doc_id) %>%
-  summarise(text = paste(word, collapse = " "))
+## Step 2: Pre-Processing
+corpus_prep <- corpus %>%
+  tm_map(content_transformer(str_to_lower)) %>% # lowercase; str_to_lower for consistent tidyverse work
+  tm_map(removeNumbers) %>% # removes numbers, as provide no useful sentiment
+  tm_map(removePunctuation) %>% # removes punctuation, which is easier than regex applications
+  tm_map(removeWords, stopwords("en")) %>% # removes English stopwords 
+  tm_map(stripWhitespace) # removes the unnecessary whitespace created when combining words
+#mutate(word = lemmatize_words(word)) # lemmatization is an incredibly slow pre-processing step; hold this out at current level of compute 
 
-# Keep doc_ids in the same order as the corpus
-corpus_doc_ids <- corpus_source_tbl$doc_id
+## Catuion --> must retain doc_id ordering when placing into corpus
+corpus_doc_ids <- model_tbl$doc_id
 
-corpus_source <- corpus_source_tbl %>%
-  pull(text) %>%
-  VectorSource() %>%
-  VCorpus()
-
+## Step 3: Generate a Dataset with a "rigorous tokenization" strategy = bigrams
 myTokenizer <- function(x) {
-  unlist(lapply(ngrams(words(x), 1:2), paste, collapse = " "))
+  unlist(lapply(ngrams(words(x), 1:2), paste, collapse = " ")) # use of RWeka tokenization; ensure have java or OpenJDK installed here
 }
 
-glassdoor_dtm <- DocumentTermMatrix(
-  corpus_source,
-  control = list(tokenize = myTokenizer)
+### Build Sparse term-document matrix & Remove spares terms
+glassdoor_dtm <- DocumentTermMatrix( # DocumentTermMatrix builds a sparse term-document matrix from the corpus
+  corpus_prep, # inputs the corpus
+  control = list(
+    tokenize = myTokenizer, # uses myTokenizer function built using RWeka
+    bounds = list(global = c(20, Inf)) # bounds argument drops terms appearing in fewer than 20 documents
+  )
 )
 
-# This trims sparse terms, setting sparseness to a small term
-glassdoor_slim_dtm <- removeSparseTerms(glassdoor_dtm, .998)
+glassdoor_slim_dtm <- removeSparseTerms(glassdoor_dtm, .95) # removeSparseTerms further trims infrequent terms; retains terms appearing in at least 5% of documents
 
 # Ratio of docs (N) to terms (k) = 3.16 N/k ratio
-nrow(model_tbl) / length(glassdoor_slim_dtm$dimnames$Terms)
+nrow(model_tbl) / length(glassdoor_slim_dtm$dimnames$Terms) # this results in a somewhat large N/k ratio; would normally aim for 2:1-3:1 but with compute at this level, retain the current ratio for model simplicity
 
 # Convert DTM to STM format using slam
-dfm2stm <- readCorpus(glassdoor_slim_dtm, type = "slam")
+dfm2stm <- readCorpus(glassdoor_slim_dtm, type = "slam") # interprets the sparse dtm and converts into a corpus representation for use in stm input analysis
 
-# Obtain optimal k, using searchK for diagnostic model
+### Obtain optimal k, using searchK for diagnostic model
 kresult <- searchK(
-  dfm2stm$documents,
-  dfm2stm$vocab,
-  K = seq(3, 10, by = 1)
+  dfm2stm$documents, # pulls documents from dtm
+  dfm2stm$vocab, # pulls vocabulary/words from dtm
+  K = seq(4,8,1) # sequences between 4 and 8 by 1, so examines 4, 5, 6, 7, and 8 k solutions
 )
 plot(kresult) # these plots show a consistent elbow-type solution at 5 topics
 
-# Fit the Latent Dirichlet Allocation Structural Topic Model (STM)
+### Fit the Latent Dirichlet Allocation Structural Topic Model (STM)
 topic_model <- stm(
-  documents = dfm2stm$documents,
-  vocab = dfm2stm$vocab,
+  documents = dfm2stm$documents, # pulls documents from dtm
+  vocab = dfm2stm$vocab, # pulls vocabulary/words from dtm
   K = 5, # 5 topics from the results of the kresult plot
   init.type = "LDA" # selected a Latent Dirichlet Allocation as in class
 )
 
-# Interpretation of topic analysis using various analytic results
+# Step 4: Analysis of NLP Dataset
+## Interpretation of topic analysis using various analytic results
 labelTopics(topic_model, n=10) # prints 10 words from each topic and examined FREX for labeling
 plot(topic_model, type="summary", n=5) # plots, summarizes the topic models
 topicCorr(topic_model) # provides intercorrelations of topic models, evaluating correlation strength of topics
 plot(topicCorr(topic_model)) # this is an output that shows the graphical relationship between topics
 
-# These three lines designate the document indices that have been retained & dropped
-kept_positions  <- as.integer(names(dfm2stm$documents))
-kept_indices    <- corpus_doc_ids[kept_positions]   # map position -> true doc_id
-all_indices     <- model_tbl$doc_id
+## These four lines designate the document indices that have been retained & dropped following topic modeling
+kept_positions <- as.integer(names(dfm2stm$documents))
+kept_indices <- corpus_doc_ids[kept_positions]
+all_indices <- model_tbl$doc_id
 dropped_indices <- setdiff(all_indices, kept_indices)
 
-# Assigns topic labels as user input to the kresult obtained topics, place in tibble for easy access
+## Assigns topic labels as user input to the kresult obtained topics, place in tibble for easy access
 topic_labels <- tibble(
-  topic       = 1:5,
-  topic_label = c("Company Culture",
+  topic = 1:5, # k = 5 model solution
+  topic_label = c("Workplace and Management Support", # these five topics were obtained through judgment-based categorization, using FREX labeling values
                   "Work-life Balance",
-                  "Compensation and Benefits Issues",
-                  "Career Development Issues",
-                  "Team Level Management")
+                  "Lead, Growth, Company Culture",
+                  "Benefits, Pay, and Work Conditions",
+                  "Career Development, Organizational Reputation")
 )
 
-# This tibble coding provides for the topics and all the retained tokens
+## This tibble coding provides for the topics and all the retained tokens
 topics_tbl <- tibble(
-  doc_id      = kept_indices,
-  topic       = apply(topic_model$theta, 1, which.max),
-  probability = apply(topic_model$theta, 1, max)
+  doc_id = kept_indices, # the retained doc_id from the indices retained after topic modeling
+  topic = apply(topic_model$theta, 1, which.max), # retains the topic with the highest probability
+  probability = apply(topic_model$theta, 1, max) # prints the word-topic probability association based on the LDA
 ) %>%
-  left_join(topic_labels, by = "topic")
+  left_join(topic_labels, by = "topic") # here the topic labels are joined on
 
-# Obtain embeddings
-n_cores_2 <- 2
-cl <- makeCluster(n_cores_2)
-registerDoParallel(cl)
+# Analysis (Step 2 - Obtain Nomic Embeddings)
 
-# NOTE: ensure ollama serve is running in a Terminal window in order to execute the dependencies of the embedding model
+## NOTE: ensure ollama serve is running in a Terminal window in order to execute the dependencies of the embedding model
+## This code was adapted from the code provided in the final assignment prompt
 get_embedding <- function(text_strings) { #returns embedding vector for any string
   response <- httr::POST(
     url = "http://localhost:11434/api/embed", # post to local Ollama server
@@ -167,14 +148,14 @@ get_embedding <- function(text_strings) { #returns embedding vector for any stri
       input = as.character(text_strings) # input is the text to embed
     ), auto_unbox = TRUE) # keeps single values from being wrapped in array
   )
-  result <- content(response, as = "parsed")
-  if (!is.null(result$embeddings)) return(result$embeddings)
-  if (!is.null(result$embedding)) return(list(result$embedding))
-  stop("No embeddings returned")
+  result <- content(response, as = "parsed") # this pulls the parsed embedding content into a result storage area
+  if (!is.null(result$embeddings)) return(result$embeddings) # examines if the embedding result is null, then it returns the result
+  # if (!is.null(result$embedding)) return(list(result$embedding)) # rerun this, but this should be deleted
+  # stop("No embeddings returned") 
 }
 
-# Establish a batch process to pull from the ollama server due to size
-batch_size <- 64
+# Establish a batch process to pull from the ollama server due to size; this was advised in an AI solution as pulling from a local server at a high rate may cause timeouts and errors
+batch_size <- 64 # Claude recommended batch size
 temp_test <- model_tbl %>%
   filter(doc_id %in% kept_indices)
 texts_all_test  <- temp_test$full_review 
@@ -185,7 +166,7 @@ batch_indices <- split(seq_len(n_docs),
 
 embeddings_list <- foreach(idx = batch_indices,
                            .packages = c("httr", "jsonlite"),
-                           .combine = "c") %do% {  # <-- %do% not %dopar%
+                           .combine = "c") %do% {  # %do% used rather than %dopar% because Ollama cannot handle concurrent connections
                              batch <- texts_all_test[idx]
                              for (i in 1:3) {
                                res <- try(get_embedding(batch), silent = TRUE)
@@ -196,26 +177,25 @@ embeddings_list <- foreach(idx = batch_indices,
                              res
                            }
 
-stopCluster(cl)
 
- 
 # Obtain Embedding Matrix
-embed_matrix <- do.call(rbind, embeddings_list)
-colnames(embed_matrix) <- paste0("e_", seq_len(ncol(embed_matrix)))
-embed_tbl <- as_tibble(embed_matrix) %>%
-  mutate(doc_id = temp_test$doc_id, .before = 1)
-
-# Create embeddings tibble
-embed_tbl_clean <- embed_tbl %>%
-  mutate(across(e_1:e_768, as.numeric)) # generating numeric embeddings rather than a list
+embed_tbl <- do.call(rbind, embeddings_list) %>%
+  as_tibble(.name_repair = "unique") %>% # .name_repair prevents the unique column name warning seen earlier
+  set_names(paste0("e_", seq_len(ncol(.)))) %>% # seq_len(ncol(.)) preferred over seq_along for matrix column indexing
+  mutate(
+    doc_id = temp_test$doc_id, # rejoins doc_ids by position; safe here because batch order is preserved
+    across(starts_with("e_"), as.numeric), # coerces list-columns to numeric vectors
+    .before = 1 # places doc_id as first column for readability
+  )
 
 # Create a document term tibble
-dtm_tbl <- corpus_prep %>%
-  filter(doc_id %in% kept_indices) %>% 
-  count(doc_id, word) %>%
-  pivot_wider(names_from = word, values_from = n,
-              values_fill = 0, names_prefix = "w_") %>%
-  mutate(doc_id = as.integer(doc_id))
+dtm_kept_indices <- corpus_doc_ids[as.integer(glassdoor_slim_dtm$dimnames$Docs)]
+
+dtm_tbl <- glassdoor_slim_dtm %>%
+  as.matrix() %>%
+  as_tibble(.name_repair = "unique") %>%
+  set_names(paste0("w_", colnames(glassdoor_slim_dtm))) %>%
+  mutate(doc_id = dtm_kept_indices, .before = 1)        # uses DTM-derived indices rather than kept_indices
 
 # Create a theta tibble (probabilities)
 theta_tbl <- as_tibble(topic_model$theta) %>%
@@ -223,34 +203,43 @@ theta_tbl <- as_tibble(topic_model$theta) %>%
   mutate(doc_id = kept_indices, .before = 1)
 
 # Combine tibbles to serve as final dataset
-base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>% 
-  left_join(
-    dtm_tbl, by = "doc_id"
-  ) %>% 
-  left_join(
-    embed_tbl_clean, by = "doc_id"
-  ) %>% 
-  left_join(
-    theta_tbl, by = "doc_id"
-  )
+base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>%
+  left_join(dtm_tbl, by = "doc_id") %>%  # joins tokenization features (w_ prefix)
+  left_join(embed_tbl, by = "doc_id") %>%  # joins embedding features (e_ prefix)
+  left_join(theta_tbl, by = "doc_id")       # joins topic probability features (t_ prefix)
 
-write_rds(base_tbl_save, "../out/data.RDS") # saves final dataset as per line 3.3
-# base_tbl <- readRDS("../out/data.RDS")
+# write_rds(base_tbl_save, "../out/data.RDS") # saves final dataset; commented out per assignment spec (line 3.3)
 
-base_tbl <- model_tbl %>% select(doc_id, overall_rating)  
+# Load Saved Data from this point forward #
+# base_tbl_save <- readRDS("../out/data.RDS") # loads pre-built dataset; requires model_holdout below
+# ensure that all lines from # Script Settings and Resources are run before this line
+# model_holdout <- base_tbl_save %>% # reconstructs holdout index from saved data
+#   slice_sample(prop = .25) 
 
-feat_A <- base_tbl %>% left_join(dtm_tbl,   by = "doc_id") %>% na.omit()
-feat_B <- base_tbl %>% left_join(embed_tbl_clean, by = "doc_id") %>% na.omit()
-feat_C <- base_tbl %>% left_join(theta_tbl, by = "doc_id") %>% na.omit()
-feat_D <- base_tbl %>%
-  left_join(embed_tbl_clean, by = "doc_id") %>%
-  left_join(theta_tbl, by = "doc_id") %>%
-  na.omit()
+# Reconstruct feature sets from column prefixes; no intermediate tibbles required
+base_tbl <- base_tbl_save %>% select(doc_id, overall_rating) 
 
+feat_A <- base_tbl_save %>% # tokenization features only
+  select(doc_id, overall_rating, starts_with("w_")) %>% 
+  na.omit() 
+feat_B <- base_tbl_save %>% # embedding features only
+  select(doc_id, overall_rating, starts_with("e_")) %>% 
+  na.omit() 
+feat_C <- base_tbl_save %>% # topic features only
+  select(doc_id, overall_rating, starts_with("t_")) %>% 
+  na.omit() 
+feat_D <- base_tbl_save %>%  # embeddings + topics
+  select(doc_id, overall_rating, starts_with("e_"), starts_with("t_")) %>% 
+  na.omit() 
+
+# split_feat: splits any feature tibble into train/holdout lists by doc_id membership
+# list() preferred over tibble output here because caret's train() expects simple data frames, not nested tibbles
 split_feat <- function(feat_tbl) {
-  is_holdout <- feat_tbl$doc_id %in% model_holdout$doc_id
-  list(train   = feat_tbl[!is_holdout, ] %>% select(-doc_id) %>% as.data.frame(),
-       holdout = feat_tbl[ is_holdout, ] %>% select(-doc_id) %>% as.data.frame())
+  is_holdout <- feat_tbl$doc_id %in% model_holdout$doc_id  # logical index; %in% preferred over match() for readability
+  list(train   = feat_tbl[!is_holdout, ] %>% 
+         select(-doc_id), # removes doc_id as not needed for ML models
+       holdout = feat_tbl[ is_holdout, ] %>% 
+         select(-doc_id)) # removes doc_id as not needed for ML models
 }
 
 splits_A <- split_feat(feat_A)
@@ -262,14 +251,87 @@ splits_D <- split_feat(feat_D)
 cv_control <- trainControl(method = "cv", number = 10, verboseIter = T)
 
 # Begin Parallelization
+n_cores <- max(1L, detectCores(logical = FALSE) - 1L)  # leave 1 core free
 local_cluster <- makeCluster(n_cores)
 registerDoParallel(local_cluster) # activate cluster
 
+# What follows is four feature sets (A = Tokenization, B = Embeddings, C = Topics, D = Embeddings + Topics) of three models (#1 = Lasso/Ridge/Elastic Net, #2 = random forest, #3 = xgbTree)
+# I provide comments on parameter justification for the A, Tokenization set; decisions are equivalent for all other feature sets (B-D), except where commented by exception
+modA1_tm <- system.time({ # this code provides a timing function to justify decisions based on time, compute constraints
+  modelA1 <- train( # caret training function
+    overall_rating ~ ., # obtaining the overall_rating as desired from assignment
+    splits_A$train, # uses the A feature training data
+    method = "glmnet",  # method = #1 glmnet
+    na.action = na.pass, # passes any NAs (which there are many in sparse dtm data)
+    preProcess = c("medianImpute","center","scale","nzv"), # pre-processing includes median imputation, centering, scaling, and removing near-zero variance
+    trControl = cv_control # calls to the CV control
+  )
+})
 
-modA1_tm <- system.time({
-  modelA1 <- train(
+
+modA2_tm <- system.time({ # this code provides a timing function to justify decisions based on time, compute constraints
+  modelA2 <- train( # caret training function
+    overall_rating ~ ., # obtaining the overall_rating as desired from assignment
+    splits_A$train, # uses the A feature training data
+    method = "ranger",  
+    na.action = na.pass, # passes any NAs (which there are many in sparse dtm data)
+    tuneLength = 3, # limits hyperparameter grid to 3 value for speed, while still exploring a reasonable number of hyperparameters
+    preProcess = c("medianImpute","center","scale","nzv"), # pre-processing includes median imputation, centering, scaling, and removing near-zero variance
+    trControl = cv_control # calls to the CV control
+  )
+})
+
+modA3_tm <- system.time({ # this code provides a timing function to justify decisions based on time, compute constraints
+  modelA3 <- train(
     overall_rating ~ .,
-    splits_A$train, 
+    splits_A$train,
+    method = "xgbTree",
+    na.action = na.pass,
+    tuneLength = 3, 
+    preProcess = c("medianImpute","center","scale","nzv"),
+    trControl = cv_control
+  )
+})
+
+modB1_tm <- system.time({
+  modelB1 <- train(
+    overall_rating ~ .,
+    splits_B$train, 
+    method = "glmnet",  
+    na.action = na.pass, 
+    preProcess = c("medianImpute","center","scale","nzv", "pca"), 
+    trControl = cv_control
+  )
+})
+
+modB2_tm <- system.time({
+  modelB2 <- train(
+    overall_rating ~ ., 
+    splits_B$train, 
+    method = "ranger",  
+    na.action = na.pass, 
+    tuneLength = 3,
+    preProcess = c("medianImpute","center","scale","nzv", "pca"), 
+    trControl = cv_control
+  )
+})
+
+modB3_tm <- system.time({
+  modelB3 <- train(
+    overall_rating ~ .,
+    splits_B$train,
+    method = "xgbTree",
+    na.action = na.pass,
+    tuneLength = 3,
+    preProcess = c("medianImpute","center","scale","nzv", "pca"),
+    trControl = cv_control
+  )
+})
+
+modC1_tm <- system.time({
+  modelC1 <- train(
+    overall_rating ~ .,
+    splits_C$train, 
     method = "glmnet",  
     na.action = na.pass, 
     preProcess = c("medianImpute","center","scale","nzv"), 
@@ -278,116 +340,63 @@ modA1_tm <- system.time({
 })
 
 
-modA2_tm <- system.time({
-  modelA2 <- train(
+modC2_tm <- system.time({
+  modelC2 <- train(
     overall_rating ~ ., 
-    splits_A$train, 
+    splits_C$train, 
     method = "ranger",  
-    na.action = na.pass, 
+    na.action = na.pass,
+    tuneLength = 3,
     preProcess = c("medianImpute","center","scale","nzv"), 
     trControl = cv_control
   )
 })
 
-modA3_tm <- system.time({
-  modelA3 <- train(overall_rating ~ .,
-                   splits_A$train,
-                   method = "xgbTree",
-                   na.action = na.pass,
-                   preProcess = c("medianImpute","center","scale","nzv"),
-                   trControl = cv_control
-  )
-})
-
-modB1_tm <- system.time({
-  modelB1 <- train(overall_rating ~ .,
-                   splits_B$train, 
-                   method = "glmnet",  
-                   na.action = na.pass, 
-                   preProcess = c("medianImpute","center","scale","nzv"), 
-                   trControl = cv_control
-  )
-})
-
-modB2_tm <- system.time({
-  modelB2 <- train(overall_rating ~ ., 
-                   splits_B$train, 
-                   method = "ranger",  
-                   na.action = na.pass, 
-                   preProcess = c("medianImpute","center","scale","nzv"), 
-                   trControl = cv_control
-  )
-})
-
-modB3_tm <- system.time({
-  modelB3 <- train(overall_rating ~ .,
-                   splits_B$train,
-                   method = "xgbTree",
-                   na.action = na.pass,
-                   preProcess = c("medianImpute","center","scale","nzv"),
-                   trControl = cv_control
-  )
-})
-
-modC1_tm <- system.time({
-  modelC1 <- train(overall_rating ~ .,
-                   splits_C$train, 
-                   method = "glmnet",  
-                   na.action = na.pass, 
-                   preProcess = c("medianImpute","center","scale","nzv"), 
-                   trControl = cv_control
-  )
-})
-
-
-modC2_tm <- system.time({
-  modelC2 <- train(overall_rating ~ ., 
-                   splits_C$train, 
-                   method = "ranger",  
-                   na.action = na.pass, 
-                   preProcess = c("medianImpute","center","scale","nzv"), 
-                   trControl = cv_control
-  )
-})
-
 modC3_tm <- system.time({
-  modelC3 <- train(overall_rating ~ .,
-                   splits_C$train,
-                   method = "xgbTree",
-                   na.action = na.pass,
-                   preProcess = c("medianImpute","center","scale","nzv"),
-                   trControl = cv_control
+  modelC3 <- train(
+    overall_rating ~ .,
+    splits_C$train,
+    method = "xgbTree",
+    na.action = na.pass,
+    tuneLength = 3,
+    preProcess = c("medianImpute","center","scale","nzv"),
+    trControl = cv_control
   )
 })
 
 modD1_tm <- system.time({
-  modelD1 <- train(overall_rating ~ .,
-                   splits_D$train, 
-                   method = "glmnet",  
-                   na.action = na.pass, 
-                   preProcess = c("medianImpute","center","scale","nzv"), 
-                   trControl = cv_control
+  modelD1 <- train(
+    overall_rating ~ .,
+    splits_D$train, 
+    method = "glmnet",  
+    na.action = na.pass, 
+    preProcess = c("medianImpute","center","scale","nzv", "pca"), 
+    trControl = cv_control
   )
 })
 
 
 modD2_tm <- system.time({
-  modelD2 <- train(overall_rating ~ ., 
-                   splits_D$train, 
-                   method = "ranger",  
-                   na.action = na.pass, 
-                   preProcess = c("medianImpute","center","scale","nzv"), 
-                   trControl = cv_control
+  modelD2 <- train(
+    overall_rating ~ ., 
+    splits_D$train, 
+    method = "ranger",
+    tuneLength = 3,
+    na.action = na.pass, 
+    preProcess = c("medianImpute","center","scale","nzv", "pca"), 
+    trControl = cv_control
   )
 })
 
 modD3_tm <- system.time({
-  modelD3 <- train(overall_rating ~ .,
-                   splits_D$train,
-                   method = "xgbTree",
-                   na.action = na.pass,
-                   preProcess = c("medianImpute","center","scale","nzv"),
-                   trControl = cv_control
+  modelD3 <- train(
+    overall_rating ~ .,
+    splits_D$train,
+    method = "xgbTree",
+    tuneLength = 3, 
+    na.action = na.pass,
+    preProcess = c("medianImpute","center","scale","nzv", "pca"),
+    trControl = cv_control
   )
 })
 
@@ -402,11 +411,11 @@ ho_rsq <- function(model, splits) {
 }
 
 results_tbl <- tibble(
-  algo        = c("glmnet","ranger", "xgbTree",
-                  "glmnet","ranger", "xgbTree",
-                  "glmnet","ranger", "xgbTree",
+  algo        = c("glmnet","ranger","xgbTree",
+                  "glmnet","ranger","xgbTree",
+                  "glmnet","ranger","xgbTree",
                   "glmnet","ranger","xgbTree")
-                  ,
+  ,
   feature_set = c(rep("Tokenization", 3), rep("Embeddings", 3),
                   rep("Topics", 3), rep("Emb+Topics", 3)),
   cv_rsq      = c(
@@ -422,18 +431,32 @@ results_tbl <- tibble(
     ho_rsq(modelD1, splits_D), ho_rsq(modelD2, splits_D), ho_rsq(modelD3, splits_D)
   )
 ) %>%
-  mutate(across(c(cv_rsq, ho_rsq), ~ str_remove(round(.x, 2), "^0")))
+  mutate(across(c(cv_rsq, ho_rsq), ~ str_remove(round(.x, 2), "^0"))) %>%  #strips leading 0 for APA reporting
+  write_csv("../out/results_5k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, etc)
 
-times_tbl <- tibble( 
-  glmnet_time = str_remove(round(c(modA1_tm[[3]],modB1_tm[[3]],modC1_tm[[3]],modD1_tm[[3]]), 2), "^0"),
-  ranger_time = str_remove(round(c(modA2_tm[[3]],modB2_tm[[3]],modC2_tm[[3]],modD2_tm[[3]]), 2), "^0"),
-  xgbTree_time = str_remove(round(c(modA3_tm[[3]],modB3_tm[[3]],modC3_tm[[3]],modD3_tm[[3]]), 2), "^0"),
-) 
+times_tbl <- tibble( # this tibble records the times that it took to obtain the ML results
+  glmnet_time = str_remove(round(c(modA1_tm[[3]],modB1_tm[[3]],modC1_tm[[3]],modD1_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
+  ranger_time = str_remove(round(c(modA2_tm[[3]],modB2_tm[[3]],modC2_tm[[3]],modD2_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
+  xgbTree_time = str_remove(round(c(modA3_tm[[3]],modB3_tm[[3]],modC3_tm[[3]],modD3_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
+) %>% 
+  write_csv("../out/times_5k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, etc)
 
 # Publication
+
+# I ran this code at a n = 1K, 2K, and 5K stratified samples. Total ML models script time for 1K = 2.52 minutes; for 2K = 6.5 minutes; for 5K =  (see times_1k.csv, times_2k.csv, times_5k.csv in /out directory). 
+# Increasing the stratified sample likely results in just over double the time requirements, even using parallelization using 7 cores (on an 8 core machine).
+# Extending this to a sample of 838K, this script would require 2,700 hours (113 days) to compute.
+# The 1K sample obtained obtained an average in-sample R2 difference of .03, and out-of-sample R2 difference of .06. Ideally, I would continue to test increasing sample size until the difference of smaller- to larger-sample R2 asymtopes (see results_1k.csv and results_2k.csv in /out directory). 
+# Given these caveats and observations, I will move on to answering the research questions based on the 2,000 stratified sample results. 
+
+
 # RQ1. Does the use of embeddings (using the nomic-embed-text LLM embeddings model) improve prediction of satisfaction beyond a rigorous tokenization strategy?
+## ARQ1: Yes, across all three ML models, using embeddings nearly doubles the predictive power of a strategy using the A feature tokenization strategy alone. For glmnet deltaR2 = .16 and .17 for in- and out-sample respectively; ranger = .13 and .11, xgbTree = .13 and .12. 
 # RQ2. Does the use of topics improve prediction of satisfaction beyond a rigorous tokenization strategy?
+## ARQ2: No, across the three ML models, topics alone do not improve beyond a tokenization strategy. The glmnet and xgbTree models both lose .06 on in-sample while ranger loses .05. All three lose .05 on out-of-sample prediction. 
 # RQ3. Does the use of embeddings plus topics improve prediction of satisfaction beyond either alone?
+## ARQ3: There is no increase in explanation of prediction based on the combination of embeddings + topics over embeddings alone. All ML models lose variance on in-sample R2 explained, but glmnet gains slightly on out-of-sample prediction. The tree-based models are either null or a slight decrease.  
 # RQ4. What is the best prediction of overall job satisfaction achievable using text reviews as source data?
+## ARQ4: Given the decisions I made, the best achieveable prediction of job satisfaction using text reviews comes from a glmnet-based model using embeddings + topics. This resulted in an R2 of .30 and .35 for in-sample to out-of-sample respectively. Additionally, this model was able to run at just over one minute of compute time, which was significantly less than the tree-based models. 
 
 # save.image(file = "../out/final.RData") #saves an .RData file as per line 3.4
