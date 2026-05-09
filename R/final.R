@@ -35,7 +35,7 @@ glassdoor_tbl <- import_tbl %>%  # import dataset for tidyverse, small enough to
 
 
 ## Create Stratified Sample
-sample_n <- 5000 # I set this sample at 2K to minimize the processing requirements on an 8 core unit and obtain robust results
+sample_n <- 2000 # I set this sample at 2K to minimize the processing requirements on an 8 core unit and obtain robust results
 
 # Stratified sample (preserves rating distribution) for model creation
 model_tbl <- glassdoor_tbl %>%
@@ -432,19 +432,19 @@ results_tbl <- tibble(
   )
 ) %>%
   mutate(across(c(cv_rsq, ho_rsq), ~ str_remove(round(.x, 2), "^0"))) %>%  #strips leading 0 for APA reporting
-  write_csv("../out/results_5k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, etc)
+  write_csv("../out/results_2k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, etc)
 
 times_tbl <- tibble( # this tibble records the times that it took to obtain the ML results
   glmnet_time = str_remove(round(c(modA1_tm[[3]],modB1_tm[[3]],modC1_tm[[3]],modD1_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
   ranger_time = str_remove(round(c(modA2_tm[[3]],modB2_tm[[3]],modC2_tm[[3]],modD2_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
   xgbTree_time = str_remove(round(c(modA3_tm[[3]],modB3_tm[[3]],modC3_tm[[3]],modD3_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
 ) %>% 
-  write_csv("../out/times_5k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, etc)
+  write_csv("../out/times_2k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, etc)
 
 # Publication
 
-# I ran this code at a n = 1K, 2K, and 5K stratified samples. Total ML models script time for 1K = 2.52 minutes; for 2K = 6.5 minutes; for 5K =  (see times_1k.csv, times_2k.csv, times_5k.csv in /out directory). 
-# Increasing the stratified sample likely results in just over double the time requirements, even using parallelization using 7 cores (on an 8 core machine).
+# I ran this code at a n = 1K, 2K, and 5K stratified samples. Total ML models script time for 1K = 12.9 minutes; for 2K = 6.5 minutes; for 5K = 144.5 minutes (see times_1k.csv, times_2k.csv, times_5k.csv in /out directory). 
+# Increasing the stratified sample likely results in just over double the time requirements, even using parallelization using 7 cores (on an 8 core machine). Placing on the super computer would have improve performance. 
 # Extending this to a sample of 838K, this script would require 2,700 hours (113 days) to compute.
 # The 1K sample obtained obtained an average in-sample R2 difference of .03, and out-of-sample R2 difference of .06. Ideally, I would continue to test increasing sample size until the difference of smaller- to larger-sample R2 asymtopes (see results_1k.csv and results_2k.csv in /out directory). 
 # Given these caveats and observations, I will move on to answering the research questions based on the 2,000 stratified sample results. 

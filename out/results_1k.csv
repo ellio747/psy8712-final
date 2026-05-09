@@ -1,0 +1,13 @@
+algo,feature_set,cv_rsq,ho_rsq
+glmnet,Tokenization,.15,.19
+ranger,Tokenization,.15,.2
+xgbTree,Tokenization,.16,.19
+glmnet,Embeddings,.3,.35
+ranger,Embeddings,.26,.3
+xgbTree,Embeddings,.26,.22
+glmnet,Topics,.1,.11
+ranger,Topics,.09,.09
+xgbTree,Topics,.09,.08
+glmnet,Emb+Topics,.31,.33
+ranger,Emb+Topics,.25,.3
+xgbTree,Emb+Topics,.23,.2
