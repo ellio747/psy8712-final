@@ -27,24 +27,24 @@ glassdoor_tbl <- import_tbl %>%  # import dataset for tidyverse, small enough to
   select(overall_rating, headline, pros, cons) %>%  # retain outcome and text columns
   filter(!is.na(overall_rating)) %>%  # drop where the outcome is missing, which is an essential requirement of NLP
   mutate( # this creates a full_review variable combining the pro, con, and headlines into a single string
-    full_review = str_c(headline, pros, cons, sep = " ", na.rm = TRUE),
-    full_review = str_squish(full_review), # removes whitespace
-    doc_id = row_number() # assigns a parent document id
+    full_review = str_c(headline, pros, cons, sep = " ", na.rm = TRUE), # this combine function using stringr is more efficient than paste0 and associated with our block on text processing
+    full_review = str_squish(full_review), # removes whitespace, chosen to stay within tidyverse/stringr functions
+    doc_id = row_number() # assigns a parent document id, which is easier than a seq() type of function
   ) %>% 
   select(-headline, -pros, -cons) # removes unnecessary sub-text columns
 
 
 ## Create Stratified Sample
-sample_n <- 2000 # I set this sample at 2K to minimize the processing requirements on an 8 core unit and obtain robust results
+sample_n <- 5000 # I set this sample at 5K to minimize the processing requirements on an 8 core unit and obtain robust results
 
 # Stratified sample (preserves rating distribution) for model creation
 model_tbl <- glassdoor_tbl %>%
   group_by(overall_rating) %>% # groups by overall_ratings to obtain a distribution of the baseline overall_ratings
-  slice_sample(prop = sample_n / nrow(glassdoor_tbl)) %>% # slice sample takes a representative amount from the distribution at random
+  slice_sample(prop = sample_n / nrow(glassdoor_tbl)) %>% # slice sample takes a representative amount from the distribution at random, which is easier and more efficient than sample()
   ungroup() # ungroups by overall_rating and places them back in the tibble
 
 # Create Holdout and Training Datasets
-holdout_indices <- createDataPartition(model_tbl$overall_rating, p = .25, list=F) # This line creates a 25/75 split of holdout:training data
+holdout_indices <- createDataPartition(model_tbl$overall_rating, p = .25, list=F) # This line creates a 25/75 split of holdout:training data; use of caret function that internally handles stratified splitting
 model_holdout <- model_tbl[holdout_indices,]    # holdout data
 model_training <- model_tbl[-holdout_indices,]  # training data
 
@@ -52,11 +52,11 @@ model_training <- model_tbl[-holdout_indices,]  # training data
 
 ## Following 4 steps of Natural Language Processing (See 8712 Week 12 Slides for steps)
 ## Step 1: Data Wrangling/Munging
-corpus <- VCorpus(VectorSource(model_tbl$full_review)) # creation of volitle corpus; keeps documents in memory rather than on disk
+corpus <- VCorpus(VectorSource(model_tbl$full_review)) # creation of volitle corpus; keeps documents in memory rather than on disk, which is preferred over Corpus() due to its higher disk-based storage requirement
 
 ## Step 2: Pre-Processing
 corpus_prep <- corpus %>%
-  tm_map(content_transformer(str_to_lower)) %>% # lowercase; str_to_lower for consistent tidyverse work
+  tm_map(content_transformer(str_to_lower)) %>% # lowercase; str_to_lower for consistent tidyverse work; need content_transformer here as stringr functions are combined with tm-based functions
   tm_map(removeNumbers) %>% # removes numbers, as provide no useful sentiment
   tm_map(removePunctuation) %>% # removes punctuation, which is easier than regex applications
   tm_map(removeWords, stopwords("en")) %>% # removes English stopwords 
@@ -80,13 +80,13 @@ glassdoor_dtm <- DocumentTermMatrix( # DocumentTermMatrix builds a sparse term-d
   )
 )
 
-glassdoor_slim_dtm <- removeSparseTerms(glassdoor_dtm, .95) # removeSparseTerms further trims infrequent terms; retains terms appearing in at least 5% of documents
+glassdoor_slim_dtm <- removeSparseTerms(glassdoor_dtm, .95) # removeSparseTerms further trims infrequent terms; retains terms appearing in at least 5% of documents, which was based on an efficiency for compute, although a higher n:K ratio
 
 # Ratio of docs (N) to terms (k) = 3.16 N/k ratio
 nrow(model_tbl) / length(glassdoor_slim_dtm$dimnames$Terms) # this results in a somewhat large N/k ratio; would normally aim for 2:1-3:1 but with compute at this level, retain the current ratio for model simplicity
 
 # Convert DTM to STM format using slam
-dfm2stm <- readCorpus(glassdoor_slim_dtm, type = "slam") # interprets the sparse dtm and converts into a corpus representation for use in stm input analysis
+dfm2stm <- readCorpus(glassdoor_slim_dtm, type = "slam") # interprets the sparse dtm and converts into a corpus representation for use in stm input analysis, using slam package for compatibility with tm-based corpora
 
 ### Obtain optimal k, using searchK for diagnostic model
 kresult <- searchK(
@@ -150,8 +150,6 @@ get_embedding <- function(text_strings) { #returns embedding vector for any stri
   )
   result <- content(response, as = "parsed") # this pulls the parsed embedding content into a result storage area
   if (!is.null(result$embeddings)) return(result$embeddings) # examines if the embedding result is null, then it returns the result
-  # if (!is.null(result$embedding)) return(list(result$embedding)) # rerun this, but this should be deleted
-  # stop("No embeddings returned") 
 }
 
 # Establish a batch process to pull from the ollama server due to size; this was advised in an AI solution as pulling from a local server at a high rate may cause timeouts and errors
@@ -161,29 +159,31 @@ temp_test <- model_tbl %>%
 texts_all_test  <- temp_test$full_review 
 n_docs     <- length(texts_all_test)
 
+# This variable produces a vector of document indices into equal sized chunks for processing the Ollama batches
 batch_indices <- split(seq_len(n_docs),
                        ceiling(seq_len(n_docs) / batch_size))
 
-embeddings_list <- foreach(idx = batch_indices,
-                           .packages = c("httr", "jsonlite"),
+# This sequence of foreach loop was a claude generated call that I evaluated several times to iterate in order to get the desired outcomes of the 768 embeddings from Ollama. 
+embeddings_list <- foreach(idx = batch_indices, # creates a foreach loop iterating over the batches in order to pull them all together, idx is the index number for each batch
+                           .packages = c("httr", "jsonlite"), # ensures access to the required libraries on the server
                            .combine = "c") %do% {  # %do% used rather than %dopar% because Ollama cannot handle concurrent connections
-                             batch <- texts_all_test[idx]
-                             for (i in 1:3) {
-                               res <- try(get_embedding(batch), silent = TRUE)
-                               if (!inherits(res, "try-error")) break
-                               Sys.sleep(1)
+                             batch <- texts_all_test[idx] # this subsets each current batch's index
+                             for (i in 1:3) { # this retry loop will attempt to batch the embedding up to three times before giving up
+                               res <- try(get_embedding(batch), silent = TRUE) # tries using an HTTP request to Ollama
+                               if (!inherits(res, "try-error")) break # evaluates if the res is a try error object, if it is a break will occur, if an error is thrown, a system sleep will try again
+                               Sys.sleep(1) # wait a second before next trial
                              }
-                             if (inherits(res, "try-error")) stop("Batch failed after retries")
-                             res
+                             if (inherits(res, "try-error")) stop("Batch failed after retries") # this if then statement stops after three failed attempts
+                             res # returns the res, or the successfully retrieved embedding
                            }
 
 
 # Obtain Embedding Matrix
 embed_tbl <- do.call(rbind, embeddings_list) %>%
-  as_tibble(.name_repair = "unique") %>% # .name_repair prevents the unique column name warning seen earlier
+  as_tibble(.name_repair = "unique") %>% # .name_repair prevents the unique column name warning I was dealing with
   set_names(paste0("e_", seq_len(ncol(.)))) %>% # seq_len(ncol(.)) preferred over seq_along for matrix column indexing
   mutate(
-    doc_id = temp_test$doc_id, # rejoins doc_ids by position; safe here because batch order is preserved
+    doc_id = temp_test$doc_id, # rejoins doc_ids by position in order to preserve the batch ordering
     across(starts_with("e_"), as.numeric), # coerces list-columns to numeric vectors
     .before = 1 # places doc_id as first column for readability
   )
@@ -191,6 +191,7 @@ embed_tbl <- do.call(rbind, embeddings_list) %>%
 # Create a document term tibble
 dtm_kept_indices <- corpus_doc_ids[as.integer(glassdoor_slim_dtm$dimnames$Docs)]
 
+# Create a dtm tibble from the glassdoor_slim tibble, ensuring as.matrix is used for analysis later
 dtm_tbl <- glassdoor_slim_dtm %>%
   as.matrix() %>%
   as_tibble(.name_repair = "unique") %>%
@@ -206,7 +207,7 @@ theta_tbl <- as_tibble(topic_model$theta) %>%
 base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>%
   left_join(dtm_tbl, by = "doc_id") %>%  # joins tokenization features (w_ prefix)
   left_join(embed_tbl, by = "doc_id") %>%  # joins embedding features (e_ prefix)
-  left_join(theta_tbl, by = "doc_id")       # joins topic probability features (t_ prefix)
+  left_join(theta_tbl, by = "doc_id") # joins topic probability features (t_ prefix)
 
 # write_rds(base_tbl_save, "../out/data.RDS") # saves final dataset; commented out per assignment spec (line 3.3)
 
@@ -216,7 +217,7 @@ base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>%
 # model_holdout <- base_tbl_save %>% # reconstructs holdout index from saved data
 #   slice_sample(prop = .25) 
 
-# Reconstruct feature sets from column prefixes; no intermediate tibbles required
+# Reconstruct feature sets from column prefixes
 base_tbl <- base_tbl_save %>% select(doc_id, overall_rating) 
 
 feat_A <- base_tbl_save %>% # tokenization features only
@@ -233,7 +234,6 @@ feat_D <- base_tbl_save %>%  # embeddings + topics
   na.omit() 
 
 # split_feat: splits any feature tibble into train/holdout lists by doc_id membership
-# list() preferred over tibble output here because caret's train() expects simple data frames, not nested tibbles
 split_feat <- function(feat_tbl) {
   is_holdout <- feat_tbl$doc_id %in% model_holdout$doc_id  # logical index; %in% preferred over match() for readability
   list(train   = feat_tbl[!is_holdout, ] %>% 
@@ -242,13 +242,13 @@ split_feat <- function(feat_tbl) {
          select(-doc_id)) # removes doc_id as not needed for ML models
 }
 
-splits_A <- split_feat(feat_A)
+splits_A <- split_feat(feat_A) # these lines create the splits for each of the four features using the previous function
 splits_B <- split_feat(feat_B)
 splits_C <- split_feat(feat_C)
 splits_D <- split_feat(feat_D)
 
 # Define Cross-validation control
-cv_control <- trainControl(method = "cv", number = 10, verboseIter = T)
+cv_control <- trainControl(method = "cv", number = 10, verboseIter = T) # produces a 10-fold cross-validation
 
 # Begin Parallelization
 n_cores <- max(1L, detectCores(logical = FALSE) - 1L)  # leave 1 core free
@@ -402,9 +402,10 @@ modD3_tm <- system.time({
 
 
 # End Parallelization
-stopCluster(local_cluster)
-registerDoSEQ()
+stopCluster(local_cluster) #stops the cluster
+registerDoSEQ() # closes out parallelization
 
+# Function pulling the holdout R2 as demonstrated in class
 ho_rsq <- function(model, splits) {
   cor(predict(model, splits$holdout, na.action = na.pass),
       splits$holdout$overall_rating)^2
@@ -418,13 +419,13 @@ results_tbl <- tibble(
   ,
   feature_set = c(rep("Tokenization", 3), rep("Embeddings", 3),
                   rep("Topics", 3), rep("Emb+Topics", 3)),
-  cv_rsq      = c(
+  cv_rsq      = c( # used from previous assignments on pulling in the CV rsquared
     max(modelA1$results$Rsquared, na.rm=T), max(modelA2$results$Rsquared, na.rm=T), max(modelA3$results$Rsquared, na.rm=T), 
     max(modelB1$results$Rsquared, na.rm=T), max(modelB2$results$Rsquared, na.rm=T), max(modelB3$results$Rsquared, na.rm=T),
     max(modelC1$results$Rsquared, na.rm=T), max(modelC2$results$Rsquared, na.rm=T), max(modelC3$results$Rsquared, na.rm=T), 
     max(modelD1$results$Rsquared, na.rm=T), max(modelD2$results$Rsquared, na.rm=T), max(modelD3$results$Rsquared, na.rm=T)
   ),
-  ho_rsq      = c(
+  ho_rsq      = c( # used from previous assignments bringing in the holdout rsquared
     ho_rsq(modelA1, splits_A), ho_rsq(modelA2, splits_A), ho_rsq(modelA3, splits_A),
     ho_rsq(modelB1, splits_B), ho_rsq(modelB2, splits_B), ho_rsq(modelB3, splits_B),
     ho_rsq(modelC1, splits_C), ho_rsq(modelC2, splits_C), ho_rsq(modelC3, splits_C),
@@ -432,31 +433,32 @@ results_tbl <- tibble(
   )
 ) %>%
   mutate(across(c(cv_rsq, ho_rsq), ~ str_remove(round(.x, 2), "^0"))) %>%  #strips leading 0 for APA reporting
-  write_csv("../out/results_2k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, etc)
+  write_csv("../out/results_5k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, 5K)
 
 times_tbl <- tibble( # this tibble records the times that it took to obtain the ML results
   glmnet_time = str_remove(round(c(modA1_tm[[3]],modB1_tm[[3]],modC1_tm[[3]],modD1_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
   ranger_time = str_remove(round(c(modA2_tm[[3]],modB2_tm[[3]],modC2_tm[[3]],modD2_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
   xgbTree_time = str_remove(round(c(modA3_tm[[3]],modB3_tm[[3]],modC3_tm[[3]],modD3_tm[[3]]), 2), "^0"), #strips leading 0 for APA reporting
 ) %>% 
-  write_csv("../out/times_2k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, etc)
+  write_csv("../out/times_5k.csv") # I changed this term to store my results at different strafication levels (1K, 2K, 5K)
 
 # Publication
 
-# I ran this code at a n = 1K, 2K, and 5K stratified samples. Total ML models script time for 1K = 12.9 minutes; for 2K = 6.5 minutes; for 5K = 144.5 minutes (see times_1k.csv, times_2k.csv, times_5k.csv in /out directory). 
+# I ran this code at a n = 1K, 2K, and 5K stratified samples. Total ML models script time for 1K = 12.9 minutes; for 2K = 32 minutes; for 5K = 144.5 minutes (see times_1k.csv, times_2k.csv, times_5k.csv in /out directory). 
 # Increasing the stratified sample likely results in just over double the time requirements, even using parallelization using 7 cores (on an 8 core machine). Placing on the super computer would have improve performance. 
-# Extending this to a sample of 838K, this script would require 2,700 hours (113 days) to compute.
-# The 1K sample obtained obtained an average in-sample R2 difference of .03, and out-of-sample R2 difference of .06. Ideally, I would continue to test increasing sample size until the difference of smaller- to larger-sample R2 asymtopes (see results_1k.csv and results_2k.csv in /out directory). 
-# Given these caveats and observations, I will move on to answering the research questions based on the 2,000 stratified sample results. 
+# Extending this to a sample of 838K, this script would require approximately well beyond 5K hours (200+ days) to compute.
+# The 1K sample compared to the 5K sample obtained obtained an average in-sample R2 difference of .045, and out-of-sample R2 difference of .025. Ideally, I would continue to test increasing sample size until the difference of smaller- to larger-sample R2 became asymptotic (see results_1k.csv and results_5k.csv in /out directory). 
+# Given these caveats and observations, I will move on to answering the research questions based on the 5K stratified sample results. 
 
 
 # RQ1. Does the use of embeddings (using the nomic-embed-text LLM embeddings model) improve prediction of satisfaction beyond a rigorous tokenization strategy?
-## ARQ1: Yes, across all three ML models, using embeddings nearly doubles the predictive power of a strategy using the A feature tokenization strategy alone. For glmnet deltaR2 = .16 and .17 for in- and out-sample respectively; ranger = .13 and .11, xgbTree = .13 and .12. 
+## ARQ1: Yes, across all three ML models, using embeddings nearly doubles the predictive power of a strategy using the A feature tokenization strategy alone. For glmnet deltaR2 = .16 and .18 for in- and out-sample respectively; ranger = .11 and .10, xgbTree = .10 and .11. 
 # RQ2. Does the use of topics improve prediction of satisfaction beyond a rigorous tokenization strategy?
-## ARQ2: No, across the three ML models, topics alone do not improve beyond a tokenization strategy. The glmnet and xgbTree models both lose .06 on in-sample while ranger loses .05. All three lose .05 on out-of-sample prediction. 
+## ARQ2: No, across the three ML models, topics alone do not improve beyond a tokenization strategy. The glmnet and xgbTree models both lose .04-.06 on in-sample while ranger loses .08. Again glmnet and xgbTree lose .05-.06 on out of sample, while ranger loses .10 on out of sample.  
 # RQ3. Does the use of embeddings plus topics improve prediction of satisfaction beyond either alone?
-## ARQ3: There is no increase in explanation of prediction based on the combination of embeddings + topics over embeddings alone. All ML models lose variance on in-sample R2 explained, but glmnet gains slightly on out-of-sample prediction. The tree-based models are either null or a slight decrease.  
+## ARQ3: There is very minimal increase in explanation of prediction based on the combination of embeddings + topics over embeddings alone. All ML models gain a very marginal R2 increase on in-sample R2 explained, but glmnet gains slightly on out-of-sample prediction. The tree-based models are either zero increases. 
+## The Embeddings + topics increase significantly over topics alone. This is all due to the amount of variance explained by the embeddings model. 
 # RQ4. What is the best prediction of overall job satisfaction achievable using text reviews as source data?
-## ARQ4: Given the decisions I made, the best achieveable prediction of job satisfaction using text reviews comes from a glmnet-based model using embeddings + topics. This resulted in an R2 of .30 and .35 for in-sample to out-of-sample respectively. Additionally, this model was able to run at just over one minute of compute time, which was significantly less than the tree-based models. 
+## ARQ4: Given the decisions I made, the best achievable prediction of job satisfaction using text reviews comes from a glmnet-based model using embeddings + topics. This resulted in an R2 of .35 and .38 for in-sample to out-of-sample respectively. Additionally, this model was able to run at 22 minutes of compute time, which was high yet, still less than the tree-based models. 
 
-# save.image(file = "../out/final.RData") #saves an .RData file as per line 3.4
+save.image(file = "../out/final_workspace.RData") #saves an .RData file as per line 3.4, using save.image as it requires the full workspace, per the assignment
