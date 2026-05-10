@@ -2,5 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
-/data/glassdoor_reviews.csv*.RData
+/data/glassdoor_reviews.csv
+*.RData
+/out/data.RDS
 .RHistory

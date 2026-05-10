@@ -210,6 +210,7 @@ base_tbl_save <- model_tbl %>% select(doc_id, overall_rating) %>%
   left_join(theta_tbl, by = "doc_id") # joins topic probability features (t_ prefix)
 
 # write_rds(base_tbl_save, "../out/data.RDS") # saves final dataset; commented out per assignment spec (line 3.3)
+# This is saved in a Google Drive due to size constraints; see readme file
 
 # Load Saved Data from this point forward #
 # base_tbl_save <- readRDS("../out/data.RDS") # loads pre-built dataset; requires model_holdout below
