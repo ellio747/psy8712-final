@@ -462,3 +462,4 @@ times_tbl <- tibble( # this tibble records the times that it took to obtain the 
 ## ARQ4: Given the decisions I made, the best achievable prediction of job satisfaction using text reviews comes from a glmnet-based model using embeddings + topics. This resulted in an R2 of .35 and .38 for in-sample to out-of-sample respectively. Additionally, this model was able to run at 22 minutes of compute time, which was high yet, still less than the tree-based models. 
 
 save.image(file = "../out/final_workspace.RData") #saves an .RData file as per line 3.4, using save.image as it requires the full workspace, per the assignment
+# This is saved in a Google Drive due to size constraints; see readme file
